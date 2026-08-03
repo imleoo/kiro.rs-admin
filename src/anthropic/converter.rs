@@ -263,7 +263,7 @@ fn normalize_claude_model(model: &str) -> Option<String> {
     let mut normalized = model.to_ascii_lowercase();
     loop {
         let mut stripped_suffix = false;
-        for suffix in ["-thinking", "-latest"] {
+        for suffix in ["-thinking", ".thinking", "-latest"] {
             if let Some(stripped) = normalized.strip_suffix(suffix) {
                 normalized = stripped.to_string();
                 stripped_suffix = true;
@@ -305,6 +305,18 @@ fn normalize_claude_model(model: &str) -> Option<String> {
     Some(format!("claude-{}-{}", parts[family_index], version))
 }
 
+/// 去除模型 ID 上的 thinking 变体后缀（`-thinking` / `.thinking`）。
+///
+/// 仅用于 `map_model` 未匹配到自定义别名、也不是已知 Claude 格式时的兜底透传——
+/// Kiro 原生模型族（deepseek/minimax/glm/qwen/auto 等）同样可能携带该后缀，
+/// 原样透传会把无效 ID 发给上游。
+fn strip_thinking_suffix(model: &str) -> &str {
+    model
+        .strip_suffix("-thinking")
+        .or_else(|| model.strip_suffix(".thinking"))
+        .unwrap_or(model)
+}
+
 /// 模型映射：自定义别名优先，已知 Claude 格式规范化，其余合法 ID 原样透传。
 pub fn map_model(model: &str) -> Option<String> {
     if invalid_model_reason(model).is_some() {
@@ -316,7 +328,8 @@ pub fn map_model(model: &str) -> Option<String> {
         return Some(custom.backend_id.clone());
     }
 
-    normalize_claude_model(model).or_else(|| Some(model.to_string()))
+    normalize_claude_model(model)
+        .or_else(|| Some(strip_thinking_suffix(model.trim()).to_string()))
 }
 
 /// 对请求模型做最终规范化：已知别名映射到 Kiro ID，非法 ID（空/超长/含控制字符）时原样透传给上游。
@@ -2076,6 +2089,34 @@ mod tests {
         ] {
             assert_eq!(map_model(model), Some(model.to_string()));
         }
+    }
+
+    #[test]
+    fn test_map_model_native_kiro_models_strip_thinking_suffix() {
+        // 非 Claude 原生模型透传时也要剥离 thinking 变体后缀，否则带着无效 ID
+        // 发给上游（合并时曾静默丢失，`cargo test` 不报错但行为已回归）。
+        assert_eq!(
+            map_model("deepseek-3.2-thinking"),
+            Some("deepseek-3.2".to_string())
+        );
+        assert_eq!(
+            map_model("minimax-m2.5.thinking"),
+            Some("minimax-m2.5".to_string())
+        );
+        assert_eq!(map_model("glm-5-thinking"), Some("glm-5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_dot_thinking_suffix_on_claude() {
+        // Claude 系列同时支持 `-thinking` 与 `.thinking` 两种分隔符形式。
+        assert_eq!(
+            map_model("claude-opus-4.6.thinking"),
+            Some("claude-opus-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5.thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
     }
 
     #[test]
