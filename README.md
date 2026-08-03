@@ -52,6 +52,8 @@
 - 凭据管理页增加隐私模式，默认隐藏邮箱完整信息。
 - 加强 Claude Code 工具调用兼容：内置工具做双向字段映射，流式工具参数完整后再输出，减少 `Invalid tool parameters` 和半截 JSON 导致的中断；同时过滤 Kiro 工具 XML 泄漏，并合并官方 thinking 参数与 thinking block 转换。
 
+以上是面向用户的功能概览；面向合并上游代码 / 二次开发的详细技术清单（涉及文件、配置项、已知与上游的架构分歧）见 [`docs/CUSTOM_FEATURES.md`](docs/CUSTOM_FEATURES.md)。
+
 <a id="features"></a>
 ## ✨ 功能
 
