@@ -13,13 +13,21 @@ use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    ExternalIdpImportFields, complete_external_idp_import_fields,
+    ExternalIdpImportFields, KiroCredentials, complete_external_idp_import_fields,
     normalize_import_auth_method_from_fields, validate_external_idp_endpoint,
 };
+use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
+use crate::kiro::model::requests::conversation::{
+    ConversationState, CurrentMessage, UserInputMessage,
+};
+use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{
+    IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
+};
 use crate::model::config::{Config, RetryMode};
 
 use super::error::AdminServiceError;
@@ -31,19 +39,19 @@ use super::types::{
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
     CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
+    LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
+    PollIdcLoginResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
+    RetryPolicyResponse, SelfHealConfigResponse, SetAccountThrottleConfigRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
-    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    SetRetryPolicyRequest, SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
+    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
-/// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
 /// 看到红点提醒，又能避免短时间内重复请求被限流。
@@ -85,6 +93,56 @@ struct CachedBalance {
     cached_at: f64,
     /// 缓存的余额数据
     data: BalanceResponse,
+}
+
+fn available_models_response(
+    id: u64,
+    selection_mode: ModelSelectionMode,
+    response: ListAvailableModelsResponse,
+) -> AvailableModelsResponse {
+    let models = response
+        .models
+        .into_iter()
+        .map(|model| {
+            let (max_input_tokens, max_output_tokens) = model
+                .token_limits
+                .map(|limits| (limits.max_input_tokens, limits.max_output_tokens))
+                .unwrap_or((None, None));
+            AvailableModelItem {
+                model_id: model.model_id,
+                model_name: model.model_name,
+                description: model.description,
+                max_input_tokens,
+                max_output_tokens,
+            }
+        })
+        .collect();
+
+    AvailableModelsResponse {
+        id,
+        selection_mode,
+        models,
+    }
+}
+
+fn validate_model_id(model_id: &str) -> Result<&str, AdminServiceError> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err(AdminServiceError::InvalidCredential(
+            "模型 ID 不能为空".to_string(),
+        ));
+    }
+    if model_id.len() > 256 || model_id.chars().any(char::is_control) {
+        return Err(AdminServiceError::InvalidCredential(
+            "模型 ID 格式无效".to_string(),
+        ));
+    }
+    if model_id.eq_ignore_ascii_case("auto") {
+        return Err(AdminServiceError::InvalidCredential(
+            "自动路由模型不支持直接测试，请选择具体模型".to_string(),
+        ));
+    }
+    Ok(model_id)
 }
 
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
@@ -184,6 +242,7 @@ impl RuntimeUpdateConfig {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    kiro_provider: Option<Arc<KiroProvider>>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -202,8 +261,6 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
-    /// 与 Anthropic 路由共享的 KiroProvider，用于 Admin 显式响应测试。
-    kiro_provider: Option<Arc<KiroProvider>>,
 }
 
 /// Social 登录会话状态
@@ -240,6 +297,7 @@ struct ExternalIdpLoginState {
 /// IdC 设备授权会话状态
 struct IdcAuthSession {
     region: String,
+    start_url: String,
     client_id: String,
     client_secret: String,
     device_code: String,
@@ -251,6 +309,15 @@ struct IdcAuthSession {
     proxy: Option<ProxyConfig>,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
+}
+
+/// 身份提供商：默认 Start URL 为 AWS Builder ID，自定义 Start URL 为企业 IAM Identity Center
+fn idc_provider_for(start_url: &str) -> &'static str {
+    if start_url == BUILDER_ID_START_URL {
+        "BuilderId"
+    } else {
+        "Enterprise"
+    }
 }
 
 /// 解析自动更新触发时间（`HH:MM`，本地 24 小时制）。允许 `H:M` 简写，
@@ -527,6 +594,7 @@ impl AdminService {
 
         let svc = Self {
             token_manager,
+            kiro_provider: None,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
@@ -537,7 +605,6 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
-            kiro_provider: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -558,6 +625,11 @@ impl AdminService {
         svc
     }
 
+    pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.kiro_provider = Some(provider);
+        self
+    }
+
     /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
@@ -574,15 +646,14 @@ impl AdminService {
         self
     }
 
-    /// 注入与业务 API 共享的 KiroProvider。
-    pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
-        self.kiro_provider = Some(provider);
-        self
-    }
-
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
+        let exposed_current_id = if self.token_manager.get_load_balancing_mode() == "balanced" {
+            0
+        } else {
+            snapshot.current_id
+        };
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
 
         // 一次性快照余额缓存，避免 N 次加锁
@@ -610,7 +681,7 @@ impl AdminService {
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
-                    is_current: entry.id == snapshot.current_id,
+                    is_current: entry.id == exposed_current_id,
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
                     provider: entry.provider,
@@ -642,7 +713,7 @@ impl AdminService {
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
-            current_id: snapshot.current_id,
+            current_id: exposed_current_id,
             credentials,
         }
     }
@@ -843,7 +914,7 @@ impl AdminService {
         })
     }
 
-    /// 获取指定凭据当前可用的模型列表（按需实时查询上游，不缓存）
+    /// 获取指定凭据当前可用的模型列表（实时查询上游，成功后更新共享模型缓存）
     pub async fn get_available_models(
         &self,
         id: u64,
@@ -854,18 +925,133 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        let models = resp
-            .models
-            .into_iter()
-            .map(|m| AvailableModelItem {
-                model_id: m.model_id,
-                model_name: m.model_name,
-                description: m.description,
-                max_input_tokens: m.token_limits.and_then(|t| t.max_input_tokens),
-            })
-            .collect();
+        Ok(available_models_response(
+            id,
+            ModelSelectionMode::Specified,
+            resp,
+        ))
+    }
 
-        Ok(AvailableModelsResponse { id, models })
+    /// 使用账号池当前选中的可用凭据实时获取模型列表。
+    pub async fn get_current_available_models(
+        &self,
+    ) -> Result<AvailableModelsResponse, AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        if snapshot.available == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "没有当前可用凭据，无法查询模型列表".to_string(),
+            ));
+        }
+
+        let (id, response, is_balanced) = self
+            .token_manager
+            .get_available_models_for_current()
+            .await
+            .map_err(|error| self.classify_balance_error(error, snapshot.current_id))?;
+
+        let selection_mode = if is_balanced {
+            ModelSelectionMode::Balanced
+        } else {
+            ModelSelectionMode::Priority
+        };
+        Ok(available_models_response(id, selection_mode, response))
+    }
+
+    /// 对指定模型发送真实、最小化的 Kiro 请求。
+    pub async fn test_model(
+        &self,
+        request: ModelTestRequest,
+    ) -> Result<ModelTestResponse, AdminServiceError> {
+        let model_id = validate_model_id(&request.model_id)?;
+
+        let provider = self
+            .kiro_provider
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("Kiro Provider 未配置".to_string()))?;
+        let conversation_state = ConversationState::new(Uuid::new_v4().to_string())
+            .with_agent_continuation_id(Uuid::new_v4().to_string())
+            .with_agent_task_type("vibe")
+            .with_chat_trigger_type("MANUAL")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("Reply with exactly: OK", model_id).with_origin("AI_EDITOR"),
+            ));
+        let body = serde_json::to_string(&KiroRequest {
+            conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: None,
+        })
+        .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        let started = std::time::Instant::now();
+        let (credential_id, bytes) =
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                let call = provider.call_api(&body, None, None).await?;
+                let credential_id = call.credential_id;
+                let bytes = call.response.bytes().await?;
+                Ok::<_, anyhow::Error>((credential_id, bytes))
+            })
+            .await
+            .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))?
+            .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+
+        let mut decoder = EventStreamDecoder::new();
+        decoder
+            .feed(&bytes)
+            .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+        let mut response_text = String::new();
+        let mut credit_usage = 0.0_f64;
+        let mut credit_unit = None;
+
+        for frame in decoder.decode_iter() {
+            let frame = frame.map_err(|error| {
+                AdminServiceError::UpstreamError(format!("模型响应解析失败: {error}"))
+            })?;
+            let event = Event::from_frame(frame).map_err(|error| {
+                AdminServiceError::UpstreamError(format!("模型事件解析失败: {error}"))
+            })?;
+            match event {
+                Event::AssistantResponse(response) => response_text.push_str(&response.content),
+                Event::Metering(metering) => {
+                    credit_usage += metering.usage;
+                    if !metering.unit.is_empty() {
+                        credit_unit = Some(metering.unit);
+                    }
+                }
+                Event::Error {
+                    error_code,
+                    error_message,
+                } => {
+                    return Err(AdminServiceError::UpstreamError(format!(
+                        "{error_code}: {error_message}"
+                    )));
+                }
+                Event::Exception {
+                    exception_type,
+                    message,
+                } => {
+                    return Err(AdminServiceError::UpstreamError(format!(
+                        "{exception_type}: {message}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let response_text = strip_tool_use_xml_leaks(&response_text);
+        if response_text.trim().is_empty() {
+            return Err(AdminServiceError::UpstreamError(
+                "模型返回了空响应".to_string(),
+            ));
+        }
+
+        Ok(ModelTestResponse {
+            model_id: model_id.to_string(),
+            credential_id,
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            response_text,
+            credit_usage: (credit_usage > 0.0).then_some(credit_usage),
+            credit_unit,
+        })
     }
 
     /// 使用指定凭据发送一次 hello，验证模型响应和耗时。
@@ -1212,6 +1398,11 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             groups: req.groups,
@@ -1356,11 +1547,7 @@ impl AdminService {
             .map_err(|e| self.classify_delete_error(e, id))?;
 
         // 清理已删除凭据的余额缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        self.invalidate_balance_cache(id);
 
         if let Some(trace_store) = &self.trace_store {
             trace_store.delete_for_credential(id);
@@ -1373,18 +1560,8 @@ impl AdminService {
     ///
     /// 每次读最新文件再写，避免多次调用之间字段互相覆盖。
     fn update_config_file(&self, updater: impl FnOnce(&mut Config)) {
-        let base = self.token_manager.config();
-        let Some(path) = base.config_path() else {
-            return;
-        };
-        match Config::load(path) {
-            Ok(mut fresh) => {
-                updater(&mut fresh);
-                if let Err(e) = fresh.save() {
-                    tracing::warn!("保存配置文件失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("读取配置文件失败（跳过持久化）: {}", e),
+        if let Err(error) = self.token_manager.update_config_file(updater) {
+            tracing::warn!("保存配置文件失败: {}", error);
         }
     }
 
@@ -1414,7 +1591,7 @@ impl AdminService {
         self.update_config_file(move |c| c.admin_api_key = Some(key));
     }
 
-    /// 持久化新的 apiKey（系统密钥轮换后同步 config.json，保证下次启动不重复导入）
+    /// 将系统密钥写回 `config.json`。
     pub fn persist_api_key(&self, new_key: &str) {
         let key = new_key.to_string();
         self.update_config_file(move |c| c.api_key = Some(key));
@@ -2057,6 +2234,54 @@ impl AdminService {
         self.get_retry_policy()
     }
 
+    /// 获取自愈治理配置
+    pub fn get_self_heal_config(&self) -> SelfHealConfigResponse {
+        let (
+            suspended_detection_enabled,
+            enabled,
+            min_interval_secs,
+            max_consecutive_rounds,
+            consecutive_rounds,
+            total_count,
+        ) = self.token_manager.get_self_heal_config();
+        SelfHealConfigResponse {
+            suspended_detection_enabled,
+            enabled,
+            min_interval_secs,
+            max_consecutive_rounds,
+            consecutive_rounds,
+            total_count,
+        }
+    }
+
+    /// 更新自愈治理配置
+    pub fn set_self_heal_config(
+        &self,
+        req: SetSelfHealConfigRequest,
+    ) -> Result<SelfHealConfigResponse, AdminServiceError> {
+        if req.suspended_detection_enabled.is_none()
+            && req.enabled.is_none()
+            && req.min_interval_secs.is_none()
+            && req.max_consecutive_rounds.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 suspendedDetectionEnabled / enabled / minIntervalSecs / maxConsecutiveRounds 一个字段"
+                    .to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_self_heal_config(
+                req.suspended_detection_enabled,
+                req.enabled,
+                req.min_interval_secs,
+                req.max_consecutive_rounds,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_self_heal_config())
+    }
+
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）
     pub fn get_log_governance_config(&self) -> LogGovernanceConfigResponse {
         let cfg = self.token_manager.config();
@@ -2138,29 +2363,17 @@ impl AdminService {
         &self,
         req: &SetLogGovernanceConfigRequest,
     ) -> anyhow::Result<()> {
-        use anyhow::Context;
-        let config_path = match self.token_manager.config().config_path() {
-            Some(p) => p.to_path_buf(),
-            None => {
-                tracing::warn!("配置文件路径未知，日志治理配置仅在当前进程生效");
-                return Ok(());
+        self.token_manager.update_config_file(|config| {
+            if let Some(value) = req.trace_enabled {
+                config.trace_enabled = value;
             }
-        };
-        let mut config = crate::model::config::Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        if let Some(v) = req.trace_enabled {
-            config.trace_enabled = v;
-        }
-        if let Some(v) = req.trace_retention_days {
-            config.trace_retention_days = v;
-        }
-        if let Some(v) = req.usage_log_retention_days {
-            config.usage_log_retention_days = v;
-        }
-        config
-            .save()
-            .with_context(|| format!("持久化日志治理配置失败: {}", config_path.display()))?;
-        Ok(())
+            if let Some(value) = req.trace_retention_days {
+                config.trace_retention_days = value;
+            }
+            if let Some(value) = req.usage_log_retention_days {
+                config.usage_log_retention_days = value;
+            }
+        })
     }
 
     /// 更新指定凭据的 refreshToken（仅限已禁用凭据）
@@ -2283,11 +2496,7 @@ impl AdminService {
             .map_err(|e| self.classify_balance_error(e, id))?;
 
         // 让本地缓存的 overage 状态失效（下次刷新时重新拉）
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        self.invalidate_balance_cache(id);
 
         // 异步触发一次新的余额查询（不阻塞响应）
         let svc_handle = self.token_manager.clone();
@@ -2334,6 +2543,12 @@ impl AdminService {
                 }
             })
             .collect()
+    }
+
+    /// 作废某个凭据的余额缓存并落盘
+    fn invalidate_balance_cache(&self, id: u64) {
+        self.balance_cache.lock().remove(&id);
+        self.save_balance_cache();
     }
 
     fn save_balance_cache(&self) {
@@ -2629,6 +2844,10 @@ impl AdminService {
             return error;
         }
         let msg = e.to_string();
+
+        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            return AdminServiceError::InvalidCredential(msg);
+        }
 
         // 1. 凭据不存在
         if msg.contains("不存在") {
@@ -3197,27 +3416,53 @@ impl AdminService {
         &self,
         req: StartIdcLoginRequest,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
-        let config = self.token_manager.config();
-        let global_proxy = self.token_manager.proxy();
-
         // 代理：优先用请求级，否则回退全局
         let proxy = req
             .proxy_url
             .as_deref()
             .map(ProxyConfig::new)
-            .or(global_proxy);
+            .or(self.token_manager.proxy());
 
-        let start_url = req.start_url.as_deref().unwrap_or(BUILDER_ID_START_URL);
+        let start_url = req
+            .start_url
+            .unwrap_or_else(|| BUILDER_ID_START_URL.to_string());
+
+        // 新建凭据独有的字段，其余由设备授权流程统一填充
+        let cred_template = KiroCredentials {
+            priority: req.priority,
+            rpm_limit: 10, // 默认每分钟 10 次（与普通添加一致；用户可在面板调整）
+            email: req.email,
+            proxy_url: req.proxy_url,
+            ..Default::default()
+        };
+
+        self.begin_idc_device_authorization(req.region, start_url, proxy, cred_template, None)
+            .await
+    }
+
+    /// 注册 OIDC 客户端、发起设备授权并登记会话。首次登录与重新登录共用。
+    ///
+    /// `cred_template` 只需带调用方独有的字段（如 priority/email），IdC 相关字段
+    /// （authMethod / provider / clientId / clientSecret / startUrl / region）在此统一写入。
+    async fn begin_idc_device_authorization(
+        &self,
+        region: String,
+        start_url: String,
+        proxy: Option<ProxyConfig>,
+        mut cred_template: KiroCredentials,
+        relogin_target_id: Option<u64>,
+    ) -> Result<StartIdcLoginResponse, AdminServiceError> {
+        let config = self.token_manager.config();
 
         // 1. 注册 OIDC 客户端
-        let reg = idc::register_client(&req.region, start_url, config, proxy.as_ref())
+        let reg = idc::register_client(&region, &start_url, config, proxy.as_ref())
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         // 2. 发起设备授权
         let device = idc::start_device_authorization(
-            &req.region,
-            start_url,
+            &region,
+            &start_url,
             &reg.client_id,
             &reg.client_secret,
             config,
@@ -3229,30 +3474,16 @@ impl AdminService {
         let expires_at = Utc::now() + Duration::seconds(device.expires_in);
         let session_id = Uuid::new_v4().to_string();
 
-        // 身份提供商：默认 Start URL 为 AWS Builder ID，自定义 Start URL 为企业 IAM Identity Center
-        let provider = if start_url == BUILDER_ID_START_URL {
-            "BuilderId"
-        } else {
-            "Enterprise"
-        };
-
-        // 构建登录成功后写入的凭据模板
-        let cred_template = KiroCredentials {
-            auth_method: Some("idc".to_string()),
-            provider: Some(provider.to_string()),
-            client_id: Some(reg.client_id.clone()),
-            client_secret: Some(reg.client_secret.clone()),
-            start_url: Some(start_url.to_string()),
-            region: Some(req.region.clone()),
-            priority: req.priority,
-            rpm_limit: 10, // 默认每分钟 10 次（与普通添加一致；用户可在面板调整）
-            email: req.email,
-            proxy_url: req.proxy_url,
-            ..Default::default()
-        };
+        cred_template.auth_method = Some("idc".to_string());
+        cred_template.provider = Some(idc_provider_for(&start_url).to_string());
+        cred_template.client_id = Some(reg.client_id.clone());
+        cred_template.client_secret = Some(reg.client_secret.clone());
+        cred_template.start_url = Some(start_url.clone());
+        cred_template.region = Some(region.clone());
 
         let session = IdcAuthSession {
-            region: req.region,
+            region,
+            start_url,
             client_id: reg.client_id,
             client_secret: reg.client_secret,
             device_code: device.device_code,
@@ -3260,7 +3491,7 @@ impl AdminService {
             poll_interval: device.interval.max(5),
             cred_template,
             proxy,
-            relogin_target_id: None,
+            relogin_target_id,
         };
 
         let poll_interval = session.poll_interval;
@@ -3283,6 +3514,7 @@ impl AdminService {
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
         let (
             region,
+            start_url,
             client_id,
             client_secret,
             device_code,
@@ -3302,6 +3534,7 @@ impl AdminService {
 
             (
                 s.region.clone(),
+                s.start_url.clone(),
                 s.client_id.clone(),
                 s.client_secret.clone(),
                 s.device_code.clone(),
@@ -3335,10 +3568,35 @@ impl AdminService {
 
                 // 重新登录模式：更新已有凭据而非创建新凭据
                 if let Some(target_id) = relogin_target_id {
-                    if let Some(refresh_token) = token.refresh_token {
-                        self.do_relogin_update(target_id, refresh_token)
-                            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                    }
+                    let refresh_token = token.refresh_token.ok_or_else(|| {
+                        AdminServiceError::InvalidCredential(
+                            "IdC 登录未返回 refreshToken，无法更新凭据".to_string(),
+                        )
+                    })?;
+                    let expires_at = token
+                        .expires_in
+                        .map(|secs| (Utc::now() + Duration::seconds(secs)).to_rfc3339());
+                    let provider = idc_provider_for(&start_url).to_string();
+
+                    self.token_manager
+                        .replace_idc_relogin_credentials(
+                            target_id,
+                            IdcReloginCredentials {
+                                access_token: token.access_token,
+                                refresh_token,
+                                expires_at,
+                                client_id,
+                                client_secret,
+                                region,
+                                start_url,
+                                provider,
+                            },
+                        )
+                        .await
+                        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+                    // 订阅等级/邮箱可能随新身份变化，作废旧缓存待下次查询重建
+                    self.invalidate_balance_cache(target_id);
                     tracing::info!("IdC 重新登录成功，凭据 #{} Token 已更新", target_id);
                     return Ok(PollIdcLoginResponse::Success {
                         credential_id: target_id,
@@ -3477,66 +3735,44 @@ impl AdminService {
         target_id: u64,
         req: StartIdcLoginRequest,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
-        // 验证目标凭据存在
-        {
-            let snapshot = self.token_manager.snapshot();
-            if !snapshot.entries.iter().any(|e| e.id == target_id) {
-                return Err(AdminServiceError::NotFound { id: target_id });
-            }
-        }
-
-        let config = self.token_manager.config();
-        let global_proxy = self.token_manager.proxy();
+        let existing_credential = self
+            .token_manager
+            .clone_credential(target_id)
+            .ok_or(AdminServiceError::NotFound { id: target_id })?;
 
         let proxy = req
             .proxy_url
             .as_deref()
             .map(ProxyConfig::new)
-            .or(global_proxy);
+            .or(self.token_manager.proxy());
 
-        let start_url = req.start_url.as_deref().unwrap_or(BUILDER_ID_START_URL);
-
-        let reg = idc::register_client(&req.region, start_url, config, proxy.as_ref())
-            .await
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        let device = idc::start_device_authorization(
-            &req.region,
-            start_url,
-            &reg.client_id,
-            &reg.client_secret,
-            config,
-            proxy.as_ref(),
-        )
-        .await
-        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        let expires_at = Utc::now() + Duration::seconds(device.expires_in);
-        let session_id = Uuid::new_v4().to_string();
-
-        let session = IdcAuthSession {
-            region: req.region,
-            client_id: reg.client_id,
-            client_secret: reg.client_secret,
-            device_code: device.device_code,
-            expires_at,
-            poll_interval: device.interval.max(5),
-            cred_template: KiroCredentials::default(),
-            proxy,
-            relogin_target_id: Some(target_id),
+        // 未指定时沿用原凭据的接入点，避免重新登录悄悄换到 Builder ID
+        let start_url = req
+            .start_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or(existing_credential.start_url.as_deref())
+            .unwrap_or(BUILDER_ID_START_URL)
+            .to_string();
+        let region = if req.region.trim().is_empty() {
+            existing_credential
+                .auth_region
+                .as_deref()
+                .or(existing_credential.region.as_deref())
+                .unwrap_or(self.token_manager.config().effective_auth_region())
+                .to_string()
+        } else {
+            req.region.trim().to_string()
         };
 
-        let poll_interval = session.poll_interval;
-        self.idc_sessions.lock().insert(session_id.clone(), session);
-
-        Ok(StartIdcLoginResponse {
-            session_id,
-            user_code: device.user_code,
-            verification_uri: device.verification_uri,
-            verification_uri_complete: device.verification_uri_complete,
-            expires_at: expires_at.to_rfc3339(),
-            poll_interval,
-        })
+        self.begin_idc_device_authorization(
+            region,
+            start_url,
+            proxy,
+            KiroCredentials::default(),
+            Some(target_id),
+        )
+        .await
     }
 }
 
@@ -3551,6 +3787,99 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::config::TlsBackend;
+
+    fn empty_proxy_pool() -> Arc<ProxyPoolManager> {
+        Arc::new(ProxyPoolManager::new(None, TlsBackend::Rustls))
+    }
+
+    #[test]
+    fn available_models_response_preserves_both_token_limits() {
+        let upstream: ListAvailableModelsResponse = serde_json::from_value(serde_json::json!({
+            "models": [{
+                "modelId": "claude-sonnet-4.5",
+                "modelName": "Claude Sonnet 4.5",
+                "tokenLimits": {
+                    "maxInputTokens": 200000,
+                    "maxOutputTokens": 64000
+                }
+            }]
+        }))
+        .unwrap();
+
+        let response = available_models_response(7, ModelSelectionMode::Specified, upstream);
+
+        assert_eq!(response.id, 7);
+        assert_eq!(response.models.len(), 1);
+        assert_eq!(response.models[0].max_input_tokens, Some(200000));
+        assert_eq!(response.models[0].max_output_tokens, Some(64000));
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["selectionMode"],
+            "specified"
+        );
+    }
+
+    #[test]
+    fn model_id_validation_trims_and_rejects_invalid_values() {
+        assert_eq!(
+            validate_model_id("  claude-sonnet-4.5  ").unwrap(),
+            "claude-sonnet-4.5"
+        );
+        assert!(validate_model_id("   ").is_err());
+        assert!(validate_model_id("claude\nsonnet").is_err());
+        assert!(validate_model_id("auto").is_err());
+        assert!(validate_model_id("AUTO").is_err());
+        assert!(validate_model_id(&"x".repeat(257)).is_err());
+    }
+
+    #[tokio::test]
+    async fn balanced_credentials_snapshot_has_no_single_current_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let first = KiroCredentials {
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            priority: 1,
+            ..KiroCredentials::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new(), empty_proxy_pool());
+
+        let response = service.get_all_credentials();
+
+        assert_eq!(response.current_id, 0);
+        assert!(response.credentials.iter().all(|item| !item.is_current));
+    }
+
+    #[tokio::test]
+    async fn priority_credentials_snapshot_preserves_single_current_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let first = KiroCredentials {
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            priority: 1,
+            ..KiroCredentials::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new(), empty_proxy_pool());
+
+        let response = service.get_all_credentials();
+
+        assert_eq!(response.current_id, 1);
+        assert!(response.credentials[0].is_current);
+        assert!(!response.credentials[1].is_current);
+    }
 
     #[test]
     fn typed_upstream_rate_limit_is_classified_without_losing_retry_after() {
@@ -3563,6 +3892,27 @@ mod tests {
             }
             other => panic!("预期 RateLimited，实际为 {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_refresh_token_is_classified_as_bad_request() {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new(), empty_proxy_pool());
+        let error = anyhow::Error::new(RefreshTokenInvalidError {
+            message: "IdC refreshToken 已失效 (invalid_grant)".to_string(),
+        });
+
+        let classified = service.classify_balance_error(error, 1);
+        assert!(matches!(
+            &classified,
+            AdminServiceError::InvalidCredential(_)
+        ));
+        assert_eq!(
+            classified.status_code(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

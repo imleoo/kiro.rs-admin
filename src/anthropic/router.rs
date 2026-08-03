@@ -58,9 +58,35 @@ pub fn create_router(
     trace_store: Option<SharedTraceStore>,
     model_mappings: Option<crate::admin::SharedModelMappingManager>,
 ) -> Router {
+    create_router_with_shared_provider(
+        kiro_provider,
+        extract_thinking,
+        tool_compatibility_mode,
+        client_keys,
+        usage_recorder,
+        usage_aggregator,
+        cache_meter,
+        trace_store,
+        model_mappings,
+    )
+}
+
+/// 创建共享 KiroProvider 的路由，供主程序同时挂载 API 与 Admin 控制面。
+#[allow(clippy::too_many_arguments)]
+pub fn create_router_with_shared_provider(
+    kiro_provider: Option<Arc<KiroProvider>>,
+    extract_thinking: bool,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    client_keys: Option<SharedClientKeyManager>,
+    usage_recorder: Option<SharedRecorder>,
+    usage_aggregator: Option<SharedAggregator>,
+    cache_meter: Option<SharedCacheMeter>,
+    trace_store: Option<SharedTraceStore>,
+    model_mappings: Option<crate::admin::SharedModelMappingManager>,
+) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
-        state = state.with_kiro_provider(provider);
+        state = state.with_shared_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);

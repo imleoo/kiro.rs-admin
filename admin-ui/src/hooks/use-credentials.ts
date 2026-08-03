@@ -8,6 +8,8 @@ import {
   clearThrottle,
   getCredentialBalance,
   getCredentialModels,
+  getCurrentCredentialModels,
+  testModel,
   addCredential,
   deleteCredential,
   updateCredential,
@@ -18,6 +20,8 @@ import {
   setAccountThrottleConfig,
   getRetryPolicy,
   setRetryPolicy,
+  getSelfHealConfig,
+  setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -51,6 +55,23 @@ export function useCredentialModels(id: number | null) {
     queryFn: () => getCredentialModels(id!),
     enabled: id !== null,
     retry: false, // 失败不重试，避免对被封禁/异常账号反复请求
+  })
+}
+
+// 使用账号池当前选中的可用凭据查询模型列表
+export function useCurrentCredentialModels(enabled: boolean) {
+  return useQuery({
+    queryKey: ['current-credential-models'],
+    queryFn: getCurrentCredentialModels,
+    enabled,
+    retry: false,
+  })
+}
+
+// 对模型发送真实请求
+export function useTestModel() {
+  return useMutation({
+    mutationFn: testModel,
   })
 }
 
@@ -194,6 +215,8 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['current-credential-models'] })
     },
   })
 }
@@ -233,6 +256,26 @@ export function useSetRetryPolicy() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['retryPolicy'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 获取自愈治理配置（30s 刷新以便观测 consecutiveRounds/totalCount 变化）
+export function useSelfHealConfig() {
+  return useQuery({
+    queryKey: ['selfHealConfig'],
+    queryFn: getSelfHealConfig,
+    refetchInterval: 30_000,
+  })
+}
+
+// 更新自愈治理配置
+export function useSetSelfHealConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSelfHealConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['selfHealConfig'] })
     },
   })
 }

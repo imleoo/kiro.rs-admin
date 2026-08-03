@@ -2,10 +2,9 @@
 
 **该项目基于 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 进行的二次开发**
 
-`kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 兼容代理。它把
-`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens` 等 Anthropic 风格请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
+`kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 与 OpenAI Chat Completions / Responses API 兼容代理。它把 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 等请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
 
-项目当前的核心目标是：让 Claude Code、Anthropic SDK 或其它兼容 Anthropic API 的客户端，通过统一的本地 / 自托管服务访问 Kiro 账号能力，同时在服务端集中处理多凭据、token 刷新、故障转移、用量统计和可观测性。
+项目当前的核心目标是：让 Claude Code、Codex CLI、Anthropic / OpenAI SDK 或其它兼容客户端，通过统一的本地 / 自托管服务访问 Kiro 账号能力，同时在服务端集中处理多凭据、token 刷新、故障转移、用量统计和可观测性。
 
 ## 🔎 快速引导
 
@@ -57,8 +56,10 @@
 ## ✨ 功能
 
 - **Anthropic Messages API 兼容**：`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens`。
+- **OpenAI API 兼容**：`/v1/chat/completions` 和 `/v1/responses`，支持非流式响应与合成 SSE，可供 OpenAI SDK 和新版 Codex CLI 使用。
 - **Claude Code 兼容端点**：`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
-- 流式和非流式响应：支持 Anthropic SSE 事件格式。
+- **GPT-5.6 模型族**：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
+- 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
 - **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级、`balanced` 均衡分配、`least_conn` 最少在途负载。
@@ -72,7 +73,7 @@
 - **Prompt cache 计量**：模拟 Anthropic cache_control 的 `cache_creation` / `cache_read` token 统计。
 - **用量统计**：按客户端 Key、模型、凭据、日期聚合 input/output/cache token 和 credits。
 - **请求链路追踪**：SQLite `traces.db`，记录成功 / 失败请求、尝试链路和错误类型。
-- 客户端 Key 分发：Admin 面板生成 `csk_*` Key，支持独立启停和统计。
+- 客户端 Key 分发：Admin 面板生成 Key，支持独立启停、轮换、分组和统计；鉴权不强制 Key 前缀。
 - **Admin UI**：概览、凭据管理、客户端 Key、分组、请求日志等视图，支持隐私模式、批量导入 / 导出、响应测试、模型拉取、运行时策略配置。
 - 代理能力：全局代理、凭据级代理、代理池、健康检查、自动停用、直连兜底、粘性会话 / 轮询 / 最小负载分配。
 - **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
@@ -150,6 +151,39 @@ cp config.example.json config.json
 - API: `http://<host>:8990/v1/messages`
 - Admin UI: `http://<host>:8990/admin`
 
+指定镜像版本：
+
+```bash
+KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.3 docker compose up -d
+```
+
+### 下载二进制
+
+正式版本会在本仓库 [GitHub Release](https://github.com/imleoo/kiro.rs-admin/releases/latest) 中发布以下平台产物：
+
+- Windows x64
+- Linux x64 / arm64
+- Linux musl x64 / arm64
+- macOS x64 / arm64
+
+下载后把二进制放到工作目录，首次启动会自动生成 `config.json` 和 `credentials.json`。
+
+```bash
+./kiro-rs
+```
+
+Windows:
+
+```powershell
+.\kiro-rs.exe
+```
+
+指定配置文件：
+
+```bash
+./kiro-rs --config /path/to/config.json --credentials /path/to/credentials.json
+```
+
 测试：
 
 ```bash
@@ -159,7 +193,9 @@ cargo test
 <a id="api-usage"></a>
 ## 调用 API
 
-`/v1` 路由支持 `x-api-key` 和 `Authorization: Bearer` 两种鉴权方式。Key 可以是主 `apiKey`，也可以是 Admin 面板生成的 `csk_*` 客户端 Key。
+`/v1` 路由支持 `x-api-key` 和 `Authorization: Bearer` 两种鉴权方式。Key 可以是 `config.json` 中用户自定义的 `apiKey`，也可以是 Admin 面板生成的 `sk-...` 客户端 Key。鉴权只比较完整 Key，不限制自定义 `apiKey` 的前缀或格式。
+
+### Anthropic Messages
 
 ```bash
 curl http://127.0.0.1:8990/v1/messages \
@@ -212,6 +248,63 @@ curl http://127.0.0.1:8990/v1/messages/count_tokens \
   }'
 ```
 
+### OpenAI Chat Completions
+
+`POST /v1/chat/completions` 接受 OpenAI 消息、函数工具、`tool_choice`、`reasoning_effort`、`max_tokens` / `max_completion_tokens`：
+
+```bash
+curl http://127.0.0.1:8990/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kiro-rs-..." \
+  -d '{
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "high",
+    "stream": false,
+    "messages": [
+      { "role": "user", "content": "Hello from an OpenAI client" }
+    ]
+  }'
+```
+
+### OpenAI Responses / Codex CLI
+
+`POST /v1/responses` 接受字符串或 input item 数组形式的 `input`，并支持 `instructions`、`reasoning.effort`、`max_output_tokens` 和非流式 / SSE 响应：
+
+```bash
+curl http://127.0.0.1:8990/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kiro-rs-..." \
+  -d '{
+    "model": "gpt-5.6-sol",
+    "instructions": "Answer concisely.",
+    "input": "What can you do?",
+    "reasoning": { "effort": "high" },
+    "stream": false
+  }'
+```
+
+新版 Codex CLI 使用 Responses API。可在 `~/.codex/config.toml` 中添加：
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "kiro-rs"
+
+[model_providers.kiro-rs]
+name = "kiro-rs"
+base_url = "http://127.0.0.1:8990/v1"
+env_key = "KIRO_RS_API_KEY"
+wire_api = "responses"
+```
+
+启动 Codex 前设置与 `config.apiKey` 或客户端 Key 相同的环境变量：
+
+```bash
+export KIRO_RS_API_KEY='sk-kiro-rs-...'
+codex
+```
+
+两个 OpenAI 端点都会复用现有的模型映射、凭据故障转移和用量计量链路。当前实现会先取得完整的内部非流式响应，再为 `stream: true` 合成 SSE，因此不是逐 token 的上游实时流。Responses 端点不会把 Codex 的 `exec`、`shell`、`apply_patch` 等本地执行工具声明转发给 Kiro；时效性查询由服务端的 Kiro MCP WebSearch 处理。
+
 <a id="api-routes"></a>
 ## API 路由
 
@@ -219,7 +312,7 @@ curl http://127.0.0.1:8990/v1/messages/count_tokens \
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/v1/models` | 返回本服务声明支持的兼容模型列表 |
+| `GET` | `/v1/models` | 动态查询当前客户端 Key 可访问凭据的上游实际可用模型并聚合返回 |
 | `POST` | `/v1/messages` | Anthropic Messages API 兼容入口 |
 | `POST` | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容入口 |
 | `POST` | `/cc/v1/messages` | Claude Code 兼容入口，流式事件顺序针对 Claude Code 调整 |
@@ -248,6 +341,8 @@ curl http://127.0.0.1:8990/v1/messages/count_tokens \
 | `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
 | `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
 | `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |
+| `/api/admin/models` | 使用账号池当前选中的可用凭据实时查询模型 |
+| `/api/admin/models/test` | 对指定模型发送真实的最小化请求并返回响应、耗时和 credit |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
@@ -286,7 +381,7 @@ Admin API 鉴权同样支持：
 |---|---:|---|
 | `host` | `127.0.0.1` | 监听地址。自动生成配置时为 `0.0.0.0` |
 | `port` | `8080` | 监听端口。自动生成配置时为 `8990` |
-| `apiKey` | 无 | 主 API Key，调用 `/v1` 和 `/cc/v1` 必填 |
+| `apiKey` | 无 | 配置的 `id=0` 系统 Key；可使用任意非空自定义值，不限制前缀。`/v1` 和 `/cc/v1` 也可使用 Admin 面板创建的客户端 Key |
 | `adminApiKey` | 无 | 设置后启用 `/admin` 和 `/api/admin` |
 | `region` | `us-east-1` | 全局默认 Region |
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
@@ -302,6 +397,11 @@ Admin API 鉴权同样支持：
 | `retryMode` | `failover` | 普通 429 重试策略：`failover`、`turbo`、`fast`、`balanced`、`steady`、`polite` 或 `custom` |
 | `retryPolicy` | 无 | `retryMode=custom` 时使用的普通 429 自定义策略 |
 | `toolCompatibilityMode` | `claude-code` | `claude-code` 启用内置工具双向映射；`raw` 保留旧的 schema 透传行为 |
+| `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
+| `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |
+| `selfHealMinIntervalSecs` | `300` | 两次自愈的最小冷却间隔（秒），打断持续 403 死循环的关键 |
+| `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
+| `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
@@ -312,6 +412,8 @@ Admin API 鉴权同样支持：
 | `githubToken` | 无 | 在线更新访问 GitHub API 时使用，降低 rate limit 风险 |
 | `updateAutoApply` | `false` | 是否每天自动检查并应用新版本 |
 | `updateAutoApplyTime` | `03:00` | 自动更新时间，本地时区 `HH:MM` |
+
+非空的 `config.apiKey` 每次启动都会同步为不可删除、可轮换的系统 Key `id=0`。手动修改配置后，旧系统 Key 立即失效，新值自动启用；已有名称、描述、分组和累计统计会保留。Admin 面板新建或轮换的客户端 Key 统一以 `sk-` 开头，但请求鉴权不会对任何已存储 Key 强制检查前缀。`adminApiKey` 独立用于 Admin UI / Admin API 登录，不参与 `/v1` 业务流量鉴权。
 
 <a id="credentials"></a>
 ## 🔐 凭据
@@ -459,51 +561,53 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 <a id="models"></a>
 ## 模型
 
-`GET /v1/models` 返回本服务声明的兼容模型 ID。真实可用性仍取决于上游账号订阅；Admin 的“凭据模型”会实时调用 Kiro `ListAvailableModels` 查询该凭据实际可用模型列表，响应测试也可以直接使用这份列表。
+`GET /v1/models` 会查询当前客户端 Key 所属分组可访问的凭据，返回这些凭据上游模型列表的去重并集，不额外生成 `-thinking` 模型。列表按凭据缓存，默认 TTL 为一小时（`modelCacheTtlSecs`）；刷新部分失败时继续使用最后一次成功缓存。为兼容已有客户端，请求中仍可使用 `-thinking` 后缀自动开启 Thinking。
 
-当前声明列表包含常见 Claude 别名和 Kiro 原生模型：
+请求模型按以下顺序解析：
 
-- `auto`
-- `claude-sonnet-5` / `claude-sonnet-5-thinking`
-- `claude-opus-4.8`、`claude-opus-4.7`、`claude-opus-4.6`、`claude-opus-4.5`
-- `claude-sonnet-4.6`、`claude-sonnet-4.5`、`claude-sonnet-4`
-- `claude-haiku-4.5`
-- 兼容旧 Anthropic 风格别名：`claude-fable-5`、`claude-opus-4-8`、`claude-sonnet-4-8`、`claude-opus-4-5-20251101`、`claude-sonnet-4-5-20250929`、`claude-haiku-4-5-20251001` 及对应 `-thinking`
-- `deepseek-3.2`
-- `minimax-m2.5` / `minimax-m2.1`
-- `glm-5`
-- `qwen3-coder-next`
+1. 优先匹配 `customModels` 中的显式别名。
+2. 规范化常见 Claude ID，包括日期后缀、`latest`、`-thinking`、点号/连字符版本和旧式 `claude-3-5-sonnet` 顺序。
+3. 其余非空合法模型 ID 原样发给 Kiro，例如 `glm-5`、`minimax-m2.5`、`deepseek-3.2`、`qwen3-coder-next`。最终可用性由上游判断，新模型上线通常不需要改代码。
 
-模型映射策略：
-
-| 请求模型 | 上游模型 |
-|---|---|
-| `auto` | `auto` |
-| `deepseek-*` | 原样透传 |
-| `minimax-*` | 原样透传 |
-| `glm-*` | 原样透传 |
-| `qwen*` | 原样透传 |
-| `claude-<family>-<major>-<minor>` | 自动归一化为 `claude-<family>-<major>.<minor>` |
-| `fable`（任意） | `claude-fable-5` |
-| `sonnet` + `5`（`sonnet-5` / `sonnet5` / `sonnet.5`） | `claude-sonnet-5` |
-| `sonnet` + `4-8` / `4.8` | `claude-sonnet-4.8` |
-| `sonnet` + `4-6` / `4.6` | `claude-sonnet-4.6` |
-| `sonnet` + `4-5` / `4.5` | `claude-sonnet-4.5` |
-| `opus` + `4-8` / `4.8` | `claude-opus-4.8` |
-| `opus` + `4-7` / `4.7` | `claude-opus-4.7` |
-| `opus` + `4-6` / `4.6` | `claude-opus-4.6` |
-| `opus` + `4-5` / `4.5` | `claude-opus-4.5` |
-| 任意 `haiku` | `claude-haiku-4.5` |
-
-未命中显式规则的模型会去掉 `-thinking` 后缀后透传给上游，避免 Kiro 新模型发布后必须立即改代码；是否真正可用由 Kiro 返回结果决定。
+动态模型缓存也用于凭据路由：已确认包含目标模型的凭据优先，已加载缓存且明确不包含目标模型的凭据会跳过；尚未加载缓存的凭据仍允许尝试，因此模型列表接口暂时不可用不会形成新的本地白名单。
 
 上下文窗口估算：
 
-- `auto`、`claude-sonnet-4.6+`、`claude-sonnet-5`、`claude-opus-4.6+`、`claude-fable-5`：`1_000_000`
+- `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`、`auto`：`1_000_000`
 - `deepseek-*`：`164_000`
 - `minimax-*`：`196_000`
 - `qwen*`：`256_000`
-- 其它 Claude / 未知模型：默认按 `200_000` 估算
+- 其它模型：`200_000`
+
+### 自定义模型
+
+可在 `config.json` 增加 `customModels` 数组，把任意客户端模型别名映射到 Kiro 后端模型 ID。自定义条目**优先于**内置 Claude 格式规范化和开放透传，既能新增模型，也能覆盖模型的后端指向。
+
+```jsonc
+{
+  "customModels": [
+    {
+      "id": "my-opus",                 // 客户端请求用的模型名（大小写不敏感精确匹配）
+      "backendId": "claude-opus-4.8",  // 实际下发给 Kiro 的后端模型 ID（必填）
+      "displayName": "My Opus",        // 可选，/v1/models 展示名，缺省用 id
+      "contextWindow": 1000000,         // 可选，上下文窗口，缺省 200000
+      "maxTokens": 64000,               // 可选，/v1/models 展示的最大输出，缺省 64000
+      "supportsReasoning": true,        // 可选，是否放行原生 reasoning，缺省 false
+      "ownedBy": "custom"               // 可选，/v1/models 的 owned_by，缺省 "custom"
+    }
+  ]
+}
+```
+
+行为说明：
+
+- **匹配**：按 `id` 大小写不敏感精确匹配；客户端传 `my-opus-thinking` 时，若无同名精确条目，会自动剥离 `-thinking` 后缀回退到 `my-opus`。
+- **优先级**：命中自定义表直接返回其 `backendId`，不再走内置关键词映射，因此可用同名 `id` 覆盖内置模型的后端指向。
+- **展示**：所有 `customModels` 条目会合并到 `GET /v1/models`，同名时自定义展示名、所有者和最大输出 token 元数据优先；最终列表按模型 ID 稳定排序。
+- **上下文窗口**：设了 `contextWindow` 时以其为准，否则回退到内置估算。
+- **reasoning**：`supportsReasoning: true` 会让该 `backendId` 放行 `additionalModelRequestFields`（`output_config` 等）；后端不接受时上游会返回 400，此时置 false 即可。
+- **兼容性**：默认空数组，现有配置无需迁移；`/v1/chat/completions` 与 `/v1/responses` 因复用同一映射链路自动生效。
 
 <a id="thinking-tools-websearch"></a>
 ## Thinking、工具与 WebSearch
@@ -643,7 +747,7 @@ data/
 
 说明：
 
-- `client_api_keys.json`：Admin 生成的 `csk_*` 客户端 Key，明文存储，用于鉴权。
+- `client_api_keys.json`：系统 Key 和 Admin 生成的 `sk-...` 客户端 Key，明文存储，用于鉴权。
 - `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
 - `proxy_pool.json`：代理池与健康状态。
@@ -665,7 +769,7 @@ data/
 
 - 概览：整体请求量、token、模型分布、凭据贡献。
 - 凭据管理：添加、SSO 登录、重登、删除、禁用、优先级、余额、模型列表、超额开关、代理绑定、响应测试、隐私模式。
-- 客户端 Key：创建、编辑、禁用、删除、重置统计。
+- 客户端 Key：创建、编辑、禁用、轮换、删除、分组绑定、重置统计；系统 Key 不可删除但可轮换。
 - 分组：管理凭据分组，并按组隔离调度。
 - 请求日志：查询 `traces.db`，查看失败原因、状态码、凭据尝试链路、端点切换和 token 用量。
 
@@ -675,6 +779,7 @@ Admin 还提供：
 - 批量导入 / 导出，兼容 Account Manager、Kiro-Go、CLiProxyAPIPlus 等 JSON 格式。
 - 全局代理设置、凭据级代理、代理池健康检查、自动停用和批量分配。
 - 凭据负载均衡、代理负载均衡、普通 429 重试策略、账号级风控故障转移配置。
+- 按请求作用域和凭据隔离的自愈治理（403 封禁识别 / 冷却 / 连续上限，状态跨重启保留）。
 - trace / usage log 保留策略。
 - 在线更新、自动更新和回退。
 
@@ -764,6 +869,8 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
+当前稳定版：[v0.7.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.3)。
+
 Docker 镜像：
 
 - `zyphrzero/kiro-rs:<version>`
@@ -785,7 +892,7 @@ cargo test
 cd admin-ui && bun run build
 
 # 后端 release 构建
-cargo build --release
+cargo build --release --locked
 
 # 开启 debug 日志
 RUST_LOG=debug ./target/release/kiro-rs

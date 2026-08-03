@@ -185,6 +185,11 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    /// 返回共享凭据管理器，供模型发现等只读控制面逻辑复用。
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
     /// # Arguments
@@ -707,7 +712,8 @@ impl KiroProvider {
         let body = response.bytes().await.unwrap_or_default();
         let success = status.is_success();
         if success {
-            self.token_manager.report_success(ctx.id);
+            self.token_manager
+                .report_success_for_request(ctx.id, Some(&mapped_model));
         }
 
         Ok(CredentialTestResult {
@@ -749,7 +755,7 @@ impl KiroProvider {
                     .acquire_context_excluding(None, group, &request_throttled_ids)
                     .await
             };
-            let ctx = match ctx_result {
+            let mut ctx = match ctx_result {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
@@ -770,6 +776,10 @@ impl KiroProvider {
                 self.token_manager.record_request(ctx.id);
             }
 
+            // Pure MCP routes (including Web Search) require the same Enterprise / IdC
+            // profileArn resolution as regular model calls.
+            self.ensure_profile_arn(&mut ctx).await?;
+
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
@@ -778,7 +788,8 @@ impl KiroProvider {
                 Err(e) => {
                     last_error = Some(e);
                     // endpoint 解析失败：记为失败，换下一张凭据
-                    self.token_manager.report_failure(ctx.id);
+                    self.token_manager
+                        .report_failure_for_request(ctx.id, None, group);
                     continue;
                 }
             };
@@ -816,7 +827,7 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
+                self.token_manager.report_success_for_request(ctx.id, None);
                 return Ok(response);
             }
 
@@ -825,7 +836,9 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let has_available = self
+                    .token_manager
+                    .report_quota_exhausted_for_request(ctx.id, None, group);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -840,6 +853,21 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
+                if status.as_u16() == 403
+                    && self.token_manager.get_suspended_detection_enabled()
+                    && endpoint.is_account_suspended(&body)
+                {
+                    let has_available = self
+                        .token_manager
+                        .report_suspended_for_request(ctx.id, None, group);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -853,7 +881,9 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
+                let has_available = self
+                    .token_manager
+                    .report_failure_for_request(ctx.id, None, group);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -1047,7 +1077,8 @@ impl KiroProvider {
                         attempt_start,
                     );
                     last_error = Some(e);
-                    self.token_manager.report_failure(ctx.id);
+                    self.token_manager
+                        .report_failure_for_request(ctx.id, model.as_deref(), group);
                     continue;
                 }
             };
@@ -1125,7 +1156,8 @@ impl KiroProvider {
                     None,
                     attempt_start,
                 );
-                self.token_manager.report_success(ctx.id);
+                self.token_manager
+                    .report_success_for_request(ctx.id, model.as_deref());
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -1155,7 +1187,11 @@ impl KiroProvider {
                     attempt_start,
                 );
 
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let has_available = self.token_manager.report_quota_exhausted_for_request(
+                    ctx.id,
+                    model.as_deref(),
+                    group,
+                );
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -1191,6 +1227,46 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
+                if status.as_u16() == 403
+                    && self.token_manager.get_suspended_detection_enabled()
+                    && endpoint.is_account_suspended(&body)
+                {
+                    tracing::error!(
+                        "API 请求失败（账号被封禁，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
+                        ctx.id,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, endpoint_name, Some(403),
+                        outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
+                    );
+
+                    let has_available = self.token_manager.report_suspended_for_request(
+                        ctx.id,
+                        model.as_deref(),
+                        group,
+                    );
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（账号封禁）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1222,7 +1298,9 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
+                let has_available =
+                    self.token_manager
+                        .report_failure_for_request(ctx.id, model.as_deref(), group);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -1334,7 +1412,8 @@ impl KiroProvider {
                                 sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()),
                                 outcome::SUCCESS, None, fb_start,
                             );
-                            self.token_manager.report_success(ctx.id);
+                            self.token_manager
+                                .report_success_for_request(ctx.id, model.as_deref());
                             tracing::info!(
                                 "凭据 #{} 在备用端点 [{}] 成功（主端点 [{}] 此前 429）",
                                 ctx.id,

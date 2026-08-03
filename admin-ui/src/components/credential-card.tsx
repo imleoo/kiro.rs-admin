@@ -192,6 +192,8 @@ function getDisabledReasonStyle(reason?: string | null): {
       return { label: "已超额", variant: "warning" };
     case "TooManyFailures":
       return { label: "失败过多", variant: "destructive" };
+    case "Suspended":
+      return { label: "账号封禁", variant: "destructive" };
     case "TooManyRefreshFailures":
       return { label: "刷新失败过多", variant: "destructive" };
     case "InvalidRefreshToken":
@@ -403,7 +405,7 @@ export function CredentialCard({
   const isThrottled = !credential.disabled && throttleRemaining > 0;
   const isRateLimited = !credential.disabled && rateLimitRemainingMs > 0;
 
-  // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
+  // 卡片与列表行共用的状态描边 / 灰化（当前优先 · 超额 · 冷却 · 禁用）
   const stateClasses = [
     credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : "",
     !credential.disabled && isQuotaExceeded ? "ring-1 ring-amber-500/60" : "",
@@ -430,7 +432,7 @@ export function CredentialCard({
           className="max-w-full"
         />
       )}
-      {credential.isCurrent && <Badge variant="success">活跃</Badge>}
+      {credential.isCurrent && <Badge variant="success">当前优先</Badge>}
       {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
       {credential.disabled && reasonStyle && (
         <Badge variant={reasonStyle.variant}>已禁用 · {reasonStyle.label}</Badge>
@@ -1260,7 +1262,7 @@ export function CredentialCard({
       <AvailableModelsDialog
         open={showModelsDialog}
         onOpenChange={setShowModelsDialog}
-        credentialId={showModelsDialog ? credential.id : null}
+        credentialId={credential.id}
       />
     </>
   );

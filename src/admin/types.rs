@@ -14,7 +14,7 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
-    /// 当前活跃凭据 ID
+    /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
     pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
@@ -38,7 +38,7 @@ pub struct CredentialStatusItem {
     pub failure_count: u32,
     /// 累计失败次数（所有失败类型，只增不减，仅手动重置归零）
     pub total_failure_count: u64,
-    /// 是否为当前活跃凭据
+    /// 是否为优先级模式下的当前优先凭据；均衡模式固定为 false
     pub is_current: bool,
     /// Token 过期时间（RFC3339 格式）
     pub expires_at: Option<String>,
@@ -406,8 +406,19 @@ pub struct BalanceResponse {
 pub struct AvailableModelsResponse {
     /// 凭据 ID
     pub id: u64,
+    /// 本次模型列表使用的凭据选择方式
+    pub selection_mode: ModelSelectionMode,
     /// 该凭据（按订阅等级）当前可用的模型
     pub models: Vec<AvailableModelItem>,
+}
+
+/// 模型列表所用凭据的选择方式。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelSelectionMode {
+    Specified,
+    Priority,
+    Balanced,
 }
 
 /// 单个可用模型
@@ -425,6 +436,30 @@ pub struct AvailableModelItem {
     /// 最大输入 Token 数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<i64>,
+    /// 最大输出 Token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
+}
+
+/// 真实模型请求测试参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTestRequest {
+    pub model_id: String,
+}
+
+/// 真实模型请求测试结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTestResponse {
+    pub model_id: String,
+    pub credential_id: u64,
+    pub latency_ms: u64,
+    pub response_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_usage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_unit: Option<String>,
 }
 
 /// 凭据响应测试请求
@@ -564,6 +599,42 @@ pub struct SetRetryPolicyRequest {
     /// custom 模式的策略；非 custom 可传 null/省略
     #[serde(default)]
     pub custom_policy: Option<RetryPolicy>,
+}
+
+/// 自愈治理配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfHealConfigResponse {
+    /// 是否识别 403 封禁文案并立即禁用凭据
+    pub suspended_detection_enabled: bool,
+    /// 是否启用全账号自愈
+    pub enabled: bool,
+    /// 两次自愈的最小冷却间隔（秒）
+    pub min_interval_secs: u64,
+    /// 连续自愈最大轮数（0=不限）
+    pub max_consecutive_rounds: u32,
+    /// 所有凭据中的最大连续自愈轮数（只读观测，同一凭据成功后清零）
+    pub consecutive_rounds: u32,
+    /// 累计恢复凭据次数（只读观测，只增）
+    pub total_count: u64,
+}
+
+/// 更新自愈治理配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSelfHealConfigRequest {
+    /// 是否识别 403 封禁文案；缺省表示不修改
+    #[serde(default)]
+    pub suspended_detection_enabled: Option<bool>,
+    /// 是否启用自愈；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 自愈冷却间隔（秒）；缺省不修改，0..=86400
+    #[serde(default)]
+    pub min_interval_secs: Option<u64>,
+    /// 连续自愈上限；缺省不修改，0..=1000（0=不限）
+    #[serde(default)]
+    pub max_consecutive_rounds: Option<u32>,
 }
 
 /// 日志治理配置响应
@@ -859,7 +930,7 @@ pub struct UpdateAdminKeyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ClientKeyItem {
     pub id: u64,
-    /// 脱敏后的 Key 展示（如 csk_abcd...mnop）
+    /// 脱敏后的 Key 展示（如 sk-abcde...mnop）
     pub masked_key: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -875,7 +946,7 @@ pub struct ClientKeyItem {
     pub total_cache_read_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
+    /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
 }

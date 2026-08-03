@@ -39,7 +39,7 @@ impl ErrorResponse {
 // === Models 端点类型 ===
 
 /// 模型信息
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Model {
     pub id: String,
     pub object: String,
@@ -116,6 +116,7 @@ pub struct Metadata {
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -134,6 +135,10 @@ pub struct MessagesRequest {
     /// 且非流式请求无法消费快速路径的 SSE。`skip` 保证客户端 JSON 无法设置它。
     #[serde(skip)]
     pub force_web_search_loop: bool,
+}
+
+fn default_max_tokens() -> i32 {
+    32_000
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式
@@ -309,4 +314,32 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessagesRequest;
+
+    fn request_json(max_tokens: Option<i32>) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        if let Some(max_tokens) = max_tokens {
+            value["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        value
+    }
+
+    #[test]
+    fn messages_request_defaults_missing_max_tokens() {
+        let request: MessagesRequest = serde_json::from_value(request_json(None)).unwrap();
+        assert_eq!(request.max_tokens, 32_000);
+    }
+
+    #[test]
+    fn messages_request_preserves_explicit_max_tokens() {
+        let request: MessagesRequest = serde_json::from_value(request_json(Some(4096))).unwrap();
+        assert_eq!(request.max_tokens, 4096);
+    }
 }

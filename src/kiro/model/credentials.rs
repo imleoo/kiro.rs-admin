@@ -136,6 +136,26 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 禁用原因。与 `disabled` 一起持久化，避免重启后把自动禁用误判为手动禁用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
+    /// 当前凭据连续执行自愈的轮数。成功调用后清零。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub self_heal_consecutive_rounds: u32,
+
+    /// 当前凭据累计被自愈恢复的次数，仅用于观测。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub self_heal_total_count: u64,
+
+    /// 最近一次自愈时间（RFC3339）。用于让冷却窗口跨进程重启生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_self_heal_at: Option<String>,
+
+    /// 触发当前连续自愈轮次的模型。`None` 表示 MCP/无模型请求。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_heal_model: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -173,6 +193,10 @@ fn is_zero(value: &u32) -> bool {
 /// rpm_limit 缺省值：默认每分钟 10 次。
 fn default_rpm_limit() -> u32 {
     10
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// 仅显示长度，不暴露明文。例如 `Some(42 chars)` 或 `None`。
@@ -213,6 +237,14 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
             .field("disabled", &self.disabled)
+            .field("disabled_reason", &self.disabled_reason)
+            .field(
+                "self_heal_consecutive_rounds",
+                &self.self_heal_consecutive_rounds,
+            )
+            .field("self_heal_total_count", &self.self_heal_total_count)
+            .field("last_self_heal_at", &self.last_self_heal_at)
+            .field("self_heal_model", &self.self_heal_model)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
@@ -926,6 +958,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -940,6 +977,31 @@ mod tests {
         assert!(!json.contains("priority"));
         // rpm_limit 始终序列化（即便等于默认 10），保证 0=不限速 不被吞
         assert!(json.contains("rpmLimit"));
+    }
+
+    #[test]
+    fn test_self_heal_runtime_state_roundtrip() {
+        let credentials = KiroCredentials {
+            disabled: true,
+            disabled_reason: Some("TooManyFailures".to_string()),
+            self_heal_consecutive_rounds: 3,
+            self_heal_total_count: 8,
+            last_self_heal_at: Some("2026-07-29T00:00:00Z".to_string()),
+            self_heal_model: Some("claude-sonnet-4.8".to_string()),
+            ..KiroCredentials::default()
+        };
+
+        let json = credentials.to_pretty_json().unwrap();
+        let parsed = KiroCredentials::from_json(&json).unwrap();
+        assert!(parsed.disabled);
+        assert_eq!(parsed.disabled_reason.as_deref(), Some("TooManyFailures"));
+        assert_eq!(parsed.self_heal_consecutive_rounds, 3);
+        assert_eq!(parsed.self_heal_total_count, 8);
+        assert_eq!(
+            parsed.last_self_heal_at.as_deref(),
+            Some("2026-07-29T00:00:00Z")
+        );
+        assert_eq!(parsed.self_heal_model.as_deref(), Some("claude-sonnet-4.8"));
     }
 
     #[test]
@@ -1166,6 +1228,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1205,6 +1272,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1327,6 +1399,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],

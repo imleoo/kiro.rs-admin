@@ -4,6 +4,167 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.4] - 2026-07-28
+
+主题：**修复 IdC / Enterprise 重新登录后 Token 无法刷新，以及持续 403 场景下“全账号自愈”陷入 `全禁 → 自愈 → 403 → 再禁` 死循环的问题**。本版合并 [PR #52](https://github.com/ZyphrZero/kiro.rs/pull/52) 与 [issue #51](https://github.com/ZyphrZero/kiro.rs/issues/51) 的修复：重新登录会整体替换与 OIDC 客户端绑定的凭据；账号池则精准识别 403 封禁，并通过配置驱动的**节流 + 连续上限 + 可观测**治理自愈行为。新增配置字段均 `serde(default)`，旧 `config.json` 无需改动。
+
+### 🔧 修复 — IdC / Enterprise 重新登录凭据失配
+
+> 来源：[PR #52](https://github.com/ZyphrZero/kiro.rs/pull/52)。提交人：[@Xm798](https://github.com/Xm798)，感谢贡献。
+
+- **整体替换 OIDC 客户端绑定凭据**：IdC refresh token 与注册时生成的 `clientId` / `clientSecret` 绑定；重新登录不再只写入新 refresh token，而是同步替换 access token、refresh token、客户端注册、区域、Start URL 与 provider，避免下一次刷新因“新 token + 旧客户端”组合返回 `invalid_grant`。
+- **清理已失效或跨认证方式的字段**：重新登录后清除属于旧身份的 `profileArn`，使其在后续请求中重新解析；同时移除 `tokenEndpoint` / `issuerUrl` / `scopes` / `kiroApiKey` 等非 IdC 残留字段，并保留邮箱、API 区域、分组等与本次客户端注册无关的账号配置。
+- **Enterprise 不再静默降级**：重新登录请求未显式提供 Start URL 或区域时继承原凭据配置，不会把 Enterprise 账号按 Builder ID 默认端点重新注册。
+- **失败不再伪装成成功**：上游未返回 refresh token 时显式报错；失效 refresh token 归类为 HTTP 400，管理端可提示重新登录，而不是返回 500 或在未更新凭据时报告成功。
+- **收紧并发窗口**：强制刷新先取得凭据刷新锁再读取快照，避免与重新登录并发时继续使用旧凭据；完成内存替换后先释放全局刷新锁再持久化，防止文件写入阻塞其它账号刷新。
+- **合并后的健康状态一致**：重新登录会重置失败、禁用、自愈连续轮数、冷却时间与模型状态，但保留累计自愈次数；与本版新增的每凭据自愈状态可以共同工作。
+
+### 🐛 问题背景
+
+当所有凭据均因连续失败被自动禁用时，系统会执行"自愈"——重置失败计数并重新启用（等价于重启）。旧实现**无冷却、无上限**：持续 403 会形成 `全禁 → 自愈(重置) → 403 → 累计 3 次 → 全禁 → 自愈` 的紧密死循环，表现为自愈日志刷屏、持续无效打上游、面板状态抖动。其中一类高频根因是**账号被上游封禁**（响应体形如 `Your User ID (...) temporarily is suspended. We've locked your account ...`）——这类凭据不可能自愈恢复，重置只是徒劳地推迟下一次失败。
+
+### 🔒 修复方案一：403 账号封禁识别
+
+- 新增端点级 `is_account_suspended`：仅当 403 响应体**同时**命中 `suspended` 与 `locked your account` 两个高特异短语（大小写不敏感）时判定为封禁。只针对这类明确文案，**不影响**普通 403（权限/WAF/区域抖动），避免误伤瞬态 403。
+- 命中后立即标记凭据为 `Suspended` 并禁用、切换到下一个可用凭据，**不累计、不参与自愈**；需人工联系客服核实后经 Admin API / 面板手动重置（误判逃生途径）。
+- 新增配置项 **`suspendedDetectionEnabled`（默认 `true`）** 作为总开关；trace 新增 `account_suspended` 分类；管理面板凭据卡片新增「账号封禁」徽标。
+
+### 🔧 修复方案二：自愈治理（配置入手）
+
+对齐既有账号级风控配置的运行时可改 + 持久化模式，新增 3 个 `selfHeal*` 配置项，并将恢复状态从全局状态重构为每凭据状态：
+
+- **`selfHealEnabled`（默认 `true`）**：凭据自愈总开关。关闭后当前请求池全灭即直接失败。
+- **`selfHealMinIntervalSecs`（默认 `300`）**：同一凭据两次自愈的最小冷却间隔，将持续故障下的探测频率限制为每 5 分钟一次。
+- **`selfHealMaxConsecutiveRounds`（默认 `5`，`0`=不限）**：同一凭据、同一模型连续自愈达到上限后停止；其它凭据、分组或模型的成功不会重置该计数。
+- 自愈只恢复当前 `model/group` 作用域内可路由的凭据；不存在的分组、不支持的模型和纯 429 冷却不会修改无关凭据。
+- `disabledReason`、连续轮数、累计恢复次数和最近恢复时间随凭据原子落盘，重启不会重新启用 `Suspended` 账号或绕过连续上限。
+- 所有运行时 `config.json` 部分更新经共享锁串行化，避免并发 PUT 丢字段。
+
+### 📊 可观测性
+
+- 自愈日志记录请求 model/group、恢复凭据 ID 和数量，达上限时按凭据输出人工介入提示。
+- 新增 Admin API `GET|PUT /api/admin/config/self-heal`，读写全部 4 个开关（含 `suspendedDetectionEnabled`）并返回只读观测值 `consecutiveRounds` / `totalCount`。
+- 管理面板顶栏新增「凭据自愈」设置项，并展示最大连续轮数与累计恢复凭据次数。
+
+### 🔒 兼容性
+
+- 封禁识别只匹配 `suspended` + `locked your account` 两个高特异短语同时出现的情形，普通 403 仍走既有累计路径，不误伤瞬态 403。
+- 全部新增字段 `serde(default)`，缺省即默认值；如需完全回退旧行为，可将 `suspendedDetectionEnabled` 设为 `false`、`selfHealMinIntervalSecs` 与 `selfHealMaxConsecutiveRounds` 均设为 `0`。
+
+## [0.7.3] - 2026-07-28
+
+主题：**以 Kiro 上游实际返回的模型目录替代本地静态列表，新增按凭据缓存、分组聚合和模型感知路由，并开放未知合法模型 ID 的直接透传**。本次兼容性补丁同时扩展了 Admin 模型面板：可按账号池策略查询模型、查看输入/输出 Token 上限，并发送真实的最小化请求验证模型。已有 `customModels`、`-thinking` 请求方式和静态上下文估算继续兼容。
+
+### ✨ 新功能 — 动态模型发现与模型感知路由
+
+- **`GET /v1/models` 改为上游动态目录**：按当前客户端 Key 的凭据分组查询可访问账号，合并并去重各账号实际返回的模型；保留上游显示名和输入/输出 Token 上限，自定义模型元数据优先，最终按模型 ID 稳定排序。
+- **逐凭据模型缓存**：新增 `modelCacheTtlSecs` 配置（默认 `3600` 秒），每个凭据独立缓存并使用 singleflight 锁避免并发重复刷新；启动后后台预热。刷新失败时可继续使用最后一次成功结果，部分凭据失败不会丢弃其它凭据已经取得的模型。
+- **缓存随凭据状态失效**：编辑代理、刷新或替换凭据、删除凭据以及整体重载时会清理对应缓存，避免模型目录与实际账号配置脱节。
+- **路由优先选择已确认支持模型的凭据**：账号缓存明确包含目标模型时优先使用，明确不包含时跳过；尚无缓存的账号仍可尝试，确保上游模型列表临时不可用时不会退化成本地硬白名单。该规则同时适用于 `priority` 和 `balanced` 模式，并保持客户端 Key 分组隔离。
+
+### ✨ 增强 — 开放模型 ID 透传
+
+- **未知模型不再被静态映射表拦截**：`customModels` 显式别名仍具有最高优先级；常见 Claude 日期后缀、`latest`、`-thinking`、点号/连字符版本和旧式命名会先规范化，其余非空且格式合法的 ID（如 `glm-5`、`minimax-m2.5`、`deepseek-3.2`）原样下发给 Kiro，由上游决定可用性。
+- **未来 Claude 型号兼容**：Claude 模型规范化不再局限于当前硬编码版本，新增型号和常见别名可复用现有请求路径；未知动态模型不会盲目附加尚未确认支持的 `output_config`。
+- **请求默认值与校验补齐**：Anthropic 请求缺省 `max_tokens` 时使用 `32000`，显式传入 `0` 或负数会返回参数错误；动态目录未提供输出上限时同样展示 `32000`，GPT-5.6 和自定义模型的既有上限仍保留。
+
+### ✨ 新功能 — Admin 模型查询与真实请求测试
+
+- **账号池模型查询**：新增 `GET /api/admin/models`，按正常账号池策略选择凭据并返回 `specified` / `priority` / `balanced` 选择方式；原单凭据模型接口也返回选择方式和 `maxOutputTokens`。
+- **真实模型验证**：新增 `POST /api/admin/models/test`，使用所选凭据向指定模型发送最小化请求，返回响应文本、凭据 ID、耗时及可用的 credit 计费信息，便于区分“目录可见”和“实际可调用”。
+- **管理端模型面板升级**：支持当前账号池与指定凭据两种查看方式，展示模型 ID、名称和输入/输出 Token 上限，并可直接触发真实请求测试；刷新模型不会修改账号池的调度指针。
+
+### 🔧 修复 — 负载模式状态语义
+
+- **均衡模式不再伪造当前账号**：`balanced` 模式下状态接口的 `currentId` 固定为 `0`，所有凭据的 `isCurrent` 固定为 `false`；`priority` 模式继续准确展示当前优先凭据。
+- **只读查询不扰动调度**：模型目录查询所需的账号选择不会增加成功计数或改写均衡调度状态；从均衡模式切回优先级模式时会重新选择最高优先级的可用凭据。真实模型测试仍走正常请求链路并反映实际账号状态。
+- **不再发布合成的 thinking 别名**：动态模型列表只展示上游真实模型与显式自定义模型，不额外生成 `-thinking` 条目；请求中使用 `-thinking` 后缀自动启用 Thinking 的兼容行为保持不变。
+
+### 🧪 测试
+
+- 新增动态目录聚合、Token 上限、自定义模型覆盖、开放透传与非法 ID、`max_tokens` 校验、逐凭据缓存 TTL / singleflight / 失效、陈旧缓存降级、分组隔离、模型感知路由，以及 priority / balanced 状态切换和只读选择等回归测试。
+
+## [0.7.2] - 2026-07-26
+
+主题：**新增 `config.json` 配置驱动的自定义模型映射，并把上游 meteringEvent 的 credit 计费字段透传到 Anthropic / OpenAI 响应的 usage 对象**。本次为兼容性补丁版本：自定义模型默认空数组、完全向后兼容，credit 字段仅在收到 meteringEvent 时才追加，不影响任何既有响应结构。
+
+### ✨ 新功能 — 自定义模型支持
+
+> 来源：[PR #46](https://github.com/ZyphrZero/kiro.rs/pull/46)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- **`config.json` 新增 `customModels` 数组**：把任意客户端模型别名映射到 Kiro 后端模型 ID，并可声明 `displayName` / `contextWindow` / `maxTokens` / `supportsReasoning` / `ownedBy`。自定义条目按 `id`（大小写不敏感）精确匹配，**优先于**内置关键词模糊映射——既能新增模型，也能覆盖内置模型的后端指向。
+- **thinking 后缀回退**：客户端传 `<alias>-thinking` 而无同名精确条目时，自动剥离后缀回退到 `<alias>`，与内置映射对 thinking 变体的处理一致。
+- **`GET /v1/models` 展示**：所有自定义模型追加到列表尾部（保持配置顺序）。
+- **上下文窗口 / reasoning**：设了 `contextWindow` 时以其为准；`supportsReasoning: true` 让对应 backend_id 放行 `additionalModelRequestFields`。
+- **零透传实现**：复用项目既有的 `OnceLock` 全局配置惯例（同 `token.rs`），启动时装载一次只读注册表，`map_model` / `get_context_window_size` / `available_models` 内部查表，未改动任何函数签名。`/v1/chat/completions` 与 `/v1/responses` 因复用同一映射链路自动生效。默认空数组，向后兼容。
+
+### ✨ 新功能 — meteringEvent credit 字段透传
+
+> 来源：[PR #47](https://github.com/ZyphrZero/kiro.rs/pull/47)。提交人：[@childe](https://github.com/childe)，感谢贡献。
+
+- **usage 携带 credit 计费元数据**：把上游 meteringEvent 的 `usage` / `unit` / `unitPlural` 透传到 Anthropic 与 OpenAI 响应的 usage 对象（`credit_usage` / `credit_unit` / `credit_unit_plural`），让客户端拿到与 Kiro 后端一致的计费口径——与 kiro-rs 行为对齐。
+- **四条出口一并接线**：非流式 handler、流式 stream、OpenAI（chat completions）与 websearch_loop 均注入；字段仅在确实收到 meteringEvent 时才追加，未下发时 usage 结构保持原样，不影响既有客户端解析。
+- **metering 解析字段补齐**：`MeteringEvent` 新增 `unit` / `unit_plural` 持久化字段（默认空串），解析失败仍由 ParseError 上抛，新增空载荷默认值测试覆盖。
+
+## [0.7.1] - 2026-07-15
+
+主题：**打通 Codex CLI 完整工具链——桥接 function / custom / namespace 工具到 Anthropic 模型，并修复工具结果后空响应导致任务误标记完成的问题**。0.7.0 引入了 Responses 端点使 Codex CLI 能连接 kiro-rs，但此前仅支持纯聊天与 Web 搜索——Codex 的真实工具（shell / apply_patch / view_image / MCP 等）被全部剥离，导致 Codex 无法读写文件、执行命令或编辑代码。本版补全工具桥接的全链路：从 Codex 的工具声明收集、到 Anthropic 模型侧的 schema 翻译、再到响应侧按声明类型正确生成 `function_call` 或 `custom_tool_call`——实现 Codex CLI 与 kiro-rs 的完整能力对齐。
+
+> 来源：[PR #39](https://github.com/ZyphrZero/kiro.rs/pull/39)。提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
+
+### ✨ 新功能 — Codex CLI 完整工具桥接
+
+- **请求方向收集工具声明**：同时从 `req.tools`（顶层）和 `additional_tools` input item（Codex 0.144 把工具声明放在此处）收集工具定义，合并转换后转发给上游模型，不再忽略 Codex 的真实工具。
+- **区分 `function` 与 `custom` 工具类型**：Codex 要求应答 item 类型与声明严格一致（否则抛出 "tool invoked with incompatible payload" 并终止本轮）。`function` 类型（shell / MCP / view_image 等）→ 应答 `function_call`（JSON arguments）；`custom` 类型（apply_patch / code-mode exec 等自由文本工具）→ 应答 `custom_tool_call`（原始字符串 input）。每请求维护一张 `ToolKindMap`，请求翻译时生成、响应构造时消费，保证出方向 item 类型永远正确。
+- **自由文本工具包装与解包**：Anthropic 侧没有自由文本工具概念，进方向将 custom 工具包装为 `{"input": <string>}` 单字段 schema（grammar / format 附到 description 提示模型输入格式），出方向通过多级回退链解出原始 input 字符串（模型偶尔不守 schema 时也能兜住）。
+- **Namespace 分组支持**：Codex 0.144 的 collaboration 子代理等工具挂在 `namespace` 分组下——对 Anthropic 模型展平为 `ns__name`（`__` 连接，避免与工具名中的 `.` 冲突），应答时还原为原 `name` + `namespace` 字段。
+- **混合工具集的 Agentic Loop**：有 Codex 工具时仍注入原生 `web_search_20250305`（除非客户端已声明同名工具），请求进入 web_search agentic loop——loop 内部消化 web_search、把其它 client 工具的 `tool_use` 原样透传，实现搜索与代码工具无缝共存。
+- **软化 System Prompt**：有 Codex 工具时使用软化 nudge（"Use your other tools normally for all other work"），替代无工具时的严格 nudge（"Do not call any other tool"），让模型自由选择搜索或执行代码工具。
+- **Developer 角色 → System 映射**：Codex 的 `role:developer` message item（AGENTS.md / user_instructions / environment_context）转为 Anthropic system 消息，确保技能文件和环境上下文到达模型。
+
+### ✨ 新功能 — 推理摘要与搜索展示（Phase 2）
+
+- **推理摘要 `reasoning` item**：从上游 reasoning 事件收集思考文本，通过顶层 `kiro_thinking` 字段（非 content block）出带传递——Anthropic 客户端忽略未知顶层字段，不会回放未签名的 thinking block；Responses 译者则将其渲染为 `reasoning` summary item，供 Codex UI 展示"模型正在思考"。
+- **`web_search_call` 展示项**：内部代答的 web_search 以 `server_tool_use` 块收集，在 Responses 响应中渲染为 `web_search_call` item（含 query 与 status），Codex 界面可展示 "Searched the web"。
+- **SSE 事件序列补齐**：新增 `reasoning`、`custom_tool_call`、`web_search_call` 三类 output item 的完整 SSE 事件序列（added → delta/part → done），每个 item 保证 `output_item.done` 携带完整内容（Codex 仅从 done 构建回合）。
+
+### 🔧 修复 — 工具结果后空助手响应
+
+- **问题**：上游 Kiro 偶尔在收到 `tool_result` 后返回一个只有思考文本（无可见 assistant text、无 client 工具调用）的回合——旧代码将其序列化为 `end_turn`，导致 Codex 将该回合视为任务完成、在工具尚未执行完时错误标记任务结束。
+- **修复**：新增 `empty_tool_result_disposition` 判别——仅当最后一轮 user 消息含 `tool_result`、且助手回合无可见文本、无工具调用、无终止原因时，判定为"空洞继续"。此时重试一次；重试仍空洞则返回 `502 Bad Gateway`（而非静默标记完成）。纯思考文本本身不足以构成有效继续——Codex 需要真实 assistant 文本或 client tool call 才能保持任务生命周期正确。
+- **kiro_thinking 不重复**：只有被接受的（非空洞）回合的思考文本才累积到 `all_thinking`；被丢弃的空洞回合的思考不被回放，避免与成功回合的总结重复或矛盾。
+
+### 📝 文档
+
+- **README 更新**：反映项目已支持 OpenAI Chat Completions / Responses 端点与 Codex CLI；补充 GPT-5.6 模型族说明、流式格式说明、部署示例更新到 0.7.0。
+
+### 🧪 测试
+
+- **20 个纯单元测试**（无网络依赖）覆盖：工具声明收集（additional_tools / 顶层 / 混合）、namespace 展平与还原、custom 工具包装 schema、function 工具 schema 原样映射、noop 回退、nudge 软化、web_search 名字冲突处理、custom_tool_call 回放往返、function_call_output 数组 stringify、developer→system 映射、reasoning/web_search_call/compaction 跳过、custom_input 多级回退链、build_view 输出类型与顺序、SSE 事件完整性。
+- **4 个空响应判别测试**：工具结果后空洞重试一次→失败、有文本/工具调用则不重试、仅思考文本无可见输出仍触发重试、仅最后一条消息决定是否为工具继续场景。
+- E2E 验证（gpt-5.6-sol + claude-sonnet-4-6）：shell 读文件、apply_patch 写文件、多轮循环、实时 web_search、只读 /plan 项目研究、技能发现——均无 incompatible payload 错误。
+
+## [0.7.0] - 2026-07-15
+
+主题：**新增 GPT-5.6 模型与 OpenAI Chat Completions / Responses 兼容端点，并统一入口 API Key 的生成与自定义配置语义**。OpenAI 协议客户端（包括仅支持 Responses API 的新版 Codex CLI）现在可以直接复用 Kiro 的模型映射、凭据故障转移、用量计量、工具调用与 WebSearch 链路；同时，程序生成的入口 Key 统一使用 `sk-` 前缀，鉴权不再限制前缀，`config.json` 中的 `apiKey` 可使用任意自定义值并作为系统密钥的权威配置。
+
+### ✨ 新功能 — GPT-5.6 与 OpenAI 协议兼容
+
+> 来源：[PR #38](https://github.com/ZyphrZero/kiro.rs/pull/38)。提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
+
+- **新增 GPT-5.6 模型族**：支持 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`，模型 ID 原样传递给 Kiro；上下文窗口按 272K 处理，并通过 `GET /v1/models` 对外公布。
+- **新增 Chat Completions 端点**：`POST /v1/chat/completions` 支持 OpenAI 消息、工具调用、`reasoning_effort`、非流式响应与 SSE 响应，内部复用既有 Anthropic 请求管道。
+- **新增 Responses 端点**：`POST /v1/responses` 支持新版 Codex CLI 使用的 Responses API，转换 instructions / input / reasoning / function call，并生成对应的非流式响应或 SSE 事件序列。
+- **复用现有运行时能力**：两个 OpenAI 端点沿用同一套 API Key 鉴权、模型映射、多凭据故障转移、用量统计及 Kiro MCP WebSearch；`/cc/v1` Claude Code 路径保持不变。
+
+### 🔧 修复 — API Key 生成、自定义与轮换语义
+
+- **生成格式统一为 `sk-`**：服务端创建和轮换的客户端 Key 均为 `sk-` 加 32 位 base62 随机字符串；默认配置的生成值与示例配置值同样以 `sk-` 开头。
+- **鉴权只做完整值匹配**：删除 `csk_` 前缀常量与前缀校验，不增加旧前缀兼容分支；请求携带的 Key 只与未禁用的已存储明文做常量时间精确比较。
+- **允许任意自定义配置值**：`config.json.apiKey` 不要求 `sk-` 前缀。每次启动都将其同步为唯一的系统密钥 `id=0`；修改配置后旧系统密钥立即失效，现有名称、描述、分组与统计保持不变。
+- **Unicode 自定义 Key 安全脱敏**：管理端按 Unicode 字符而非 UTF-8 字节切片，非 ASCII 自定义 Key 不再因切到字符中间而触发运行时 panic。
+- **清理过时说明**：README、示例配置、Rust 注释与 Admin UI 统一为“系统密钥不可删除、可轮换”，移除当前文档中的 `csk_*` 生成规则描述。
+
 ## [0.6.11] - 2026-07-12
 
 主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。

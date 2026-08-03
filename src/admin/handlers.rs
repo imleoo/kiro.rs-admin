@@ -23,9 +23,10 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
-        ProxyCheckUrlRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
-        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+        ModelTestRequest, ProxyCheckUrlRequest, SetAccountThrottleConfigRequest,
+        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
+        SetLogGovernanceConfigRequest, SetPriorityRequest, SetProxyBalancingModeRequest,
+        SetRetryPolicyRequest, SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -170,6 +171,27 @@ pub async fn test_credential_response(
     {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/models
+/// 使用账号池当前选中的可用凭据实时查询上游模型列表。
+pub async fn get_current_models(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_current_available_models().await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_http_response(),
+    }
+}
+
+/// POST /api/admin/models/test
+/// 使用所选模型发送真实的最小化 Kiro 请求。
+pub async fn test_model(
+    State(state): State<AdminState>,
+    Json(request): Json<ModelTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_model(request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_http_response(),
     }
 }
 
@@ -626,6 +648,24 @@ pub async fn set_retry_policy(
     }
 }
 
+/// GET /api/admin/config/self-heal
+/// 获取自愈治理配置
+pub async fn get_self_heal_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_self_heal_config())
+}
+
+/// PUT /api/admin/config/self-heal
+/// 更新自愈治理配置（运行时生效 + 持久化 config.json）
+pub async fn set_self_heal_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSelfHealConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_self_heal_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/log-governance
 /// 获取日志治理配置（trace 开关 / trace 保留 / usage 保留）
 pub async fn get_log_governance_config(State(state): State<AdminState>) -> impl IntoResponse {
@@ -1077,8 +1117,7 @@ pub async fn rotate_client_key(
     use axum::http::StatusCode;
     match state.client_keys.rotate(id) {
         Some(entry) => {
-            // 系统密钥轮换后明文变了，需同步写回 config.json apiKey，
-            // 否则下次启动 ensure_system_key 会因旧 apiKey 不在列表而重复导入。
+            // 避免重启时被 config.apiKey 中的旧值覆盖。
             if entry.is_system {
                 state.service.persist_api_key(&entry.key);
             }

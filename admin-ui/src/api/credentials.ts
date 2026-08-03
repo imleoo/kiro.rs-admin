@@ -6,6 +6,7 @@ import type {
   AvailableModelsResponse,
   CredentialResponseTestRequest,
   CredentialResponseTestResponse,
+  ModelTestResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -170,7 +171,7 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
   return data
 }
 
-// 获取凭据当前可用的模型列表（按需实时查询上游）
+// 获取凭据当前可用的模型列表（实时查询上游并更新服务端缓存）
 export async function getCredentialModels(id: number): Promise<AvailableModelsResponse> {
   const { data } = await api.get<AvailableModelsResponse>(`/credentials/${id}/models`)
   return data
@@ -182,6 +183,22 @@ export async function testCredentialResponse(
   req: CredentialResponseTestRequest
 ): Promise<CredentialResponseTestResponse> {
   const { data } = await api.post<CredentialResponseTestResponse>(`/credentials/${id}/test`, req)
+  return data
+}
+
+// 使用账号池当前选中的可用凭据实时获取模型列表
+export async function getCurrentCredentialModels(): Promise<AvailableModelsResponse> {
+  const { data } = await api.get<AvailableModelsResponse>('/models')
+  return data
+}
+
+// 对所选模型发送真实的最小请求；超时时间略长于服务端的 90 秒上限
+export async function testModel(modelId: string): Promise<ModelTestResponse> {
+  const { data } = await api.post<ModelTestResponse>(
+    '/models/test',
+    { modelId },
+    { timeout: 100000 },
+  )
   return data
 }
 
@@ -531,6 +548,39 @@ export async function setAccountThrottleConfig(
   patch: Partial<AccountThrottleConfig>,
 ): Promise<AccountThrottleConfig> {
   const { data } = await api.put<AccountThrottleConfig>('/config/account-throttle', patch)
+  return data
+}
+
+// 自愈治理配置。suspendedDetectionEnabled/enabled/minIntervalSecs/maxConsecutiveRounds
+// 可写；consecutiveRounds 为凭据最大连续轮数，totalCount 为累计恢复凭据次数。
+export interface SelfHealConfig {
+  suspendedDetectionEnabled: boolean
+  enabled: boolean
+  minIntervalSecs: number
+  maxConsecutiveRounds: number
+  consecutiveRounds: number
+  totalCount: number
+}
+
+// 可写字段（PUT 时提交的子集）
+export type SelfHealConfigPatch = Partial<
+  Pick<
+    SelfHealConfig,
+    'suspendedDetectionEnabled' | 'enabled' | 'minIntervalSecs' | 'maxConsecutiveRounds'
+  >
+>
+
+// 获取自愈治理配置
+export async function getSelfHealConfig(): Promise<SelfHealConfig> {
+  const { data } = await api.get<SelfHealConfig>('/config/self-heal')
+  return data
+}
+
+// 更新自愈治理配置
+export async function setSelfHealConfig(
+  patch: SelfHealConfigPatch,
+): Promise<SelfHealConfig> {
+  const { data } = await api.put<SelfHealConfig>('/config/self-heal', patch)
   return data
 }
 

@@ -20,7 +20,7 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, MeteringEvent};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
@@ -36,16 +36,37 @@ use crate::model::config::ToolCompatibilityMode;
 /// Maximum number of search rounds, to prevent an infinite loop if the upstream keeps asking to search
 const MAX_WEB_SEARCH_ROUNDS: usize = 5;
 
+/// A valid assistant turn after a tool result must contain either visible text or
+/// another client tool call. Kiro occasionally closes a successful upstream stream
+/// without either, which used to be serialized as `end_turn` and made Codex mark an
+/// unfinished task complete. Retry once before surfacing an upstream error.
+const MAX_EMPTY_TOOL_RESULT_RETRIES: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyToolResultDisposition {
+    Accept,
+    Retry,
+    Fail,
+}
+
 /// Result of buffer-decoding one round of the upstream response
 struct RoundOutcome {
     /// Accumulated assistant text
     text: String,
+    /// Accumulated thinking / reasoning text (Kiro reasoningContentEvent).
+    /// Surfaced out-of-band via render_json's `kiro_thinking` so Anthropic
+    /// clients never see (and never replay) an unsigned thinking block.
+    thinking: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<CompletedToolUse>,
     /// Actual input tokens computed from contextUsageEvent
     context_input_tokens: Option<i32>,
-    /// Cumulative credits from meteringEvent
+    /// Cumulative credits from meteringEvent (sum of usage across rounds)
     credits: f64,
+    /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
+    /// 在 run_web_search_loop 出口处透传到响应 usage 字段；如果上游多次下发
+    /// 则取最后一次（与 /v1/messages 非流 / 流式路径一致）。
+    last_metering: Option<MeteringEvent>,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
     /// True if the upstream stream ended due to a read error, so the decoded
@@ -62,13 +83,66 @@ struct RoundOutcome {
     tool_name_map: std::collections::HashMap<String, String>,
 }
 
-/// 提取工具调用入参里的 `query` 字段（web_search 专用便捷函数）。
-fn tool_query(tu: &CompletedToolUse) -> String {
-    tu.input
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+/// Normalize model-produced Web Search input into one non-empty query.
+///
+/// Codex-compatible providers can emit `query`, `search_query`, `q`, a
+/// `queries` array, or wrap the text in `text`/`value`. Kiro's MCP
+/// endpoint accepts only one string in `arguments.query`.
+fn normalized_query_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => {
+            let query = s.trim();
+            (!query.is_empty()).then(|| query.to_string())
+        }
+        Value::Array(values) => values.iter().find_map(normalized_query_value),
+        Value::Object(object) => ["query", "search_query", "q", "text", "value"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(normalized_query_value)),
+        _ => None,
+    }
+}
+
+/// Extract a usable Web Search query from a model tool-use input.
+fn tool_query(tu: &CompletedToolUse) -> Option<String> {
+    ["query", "search_query", "q", "queries"]
+        .iter()
+        .find_map(|key| tu.input.get(*key).and_then(normalized_query_value))
+        .or_else(|| normalized_query_value(&tu.input))
+}
+
+fn log_invalid_web_search_input(tu: &CompletedToolUse) {
+    let (input_kind, input_details) = match &tu.input {
+        Value::Object(object) => {
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            ("object", keys.join(","))
+        }
+        Value::Array(values) => ("array", format!("len={}", values.len())),
+        Value::String(value) => ("string", format!("len={}", value.chars().count())),
+        Value::Number(_) => ("number", String::new()),
+        Value::Bool(_) => ("bool", String::new()),
+        Value::Null => ("null", String::new()),
+    };
+    tracing::warn!(
+        tool_use_id = %tu.id,
+        input_kind,
+        input_details = %input_details,
+        "web_search tool input has no usable non-empty query; returning an empty result without calling MCP"
+    );
+}
+
+fn is_no_results_mcp_error(error: &anyhow::Error) -> bool {
+    error
         .to_string()
+        .contains("MCP error: -32602 - Tool returned no results")
+}
+
+fn log_normalized_web_search_query(tu: &CompletedToolUse, query: &str) {
+    tracing::info!(
+        tool_use_id = %tu.id,
+        query_chars = query.chars().count(),
+        "web_search normalized a non-empty query before calling Kiro MCP"
+    );
 }
 
 /// Decides whether this round should keep searching (enter the next loop round)
@@ -78,6 +152,42 @@ fn tool_query(tu: &CompletedToolUse) -> String {
 fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool {
     let only_web_search = !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
+}
+
+/// Whether the request is the continuation immediately following a tool result.
+fn last_message_has_tool_result(payload: &MessagesRequest) -> bool {
+    let Some(last) = payload.messages.last() else {
+        return false;
+    };
+    if last.role != "user" {
+        return false;
+    }
+    last.content.as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+    })
+}
+
+/// Decide how to handle a successful upstream round after tool output. Reasoning
+/// by itself is intentionally not enough: Codex needs either assistant text (a
+/// real final answer) or a client tool call to keep the task lifecycle sound.
+fn empty_tool_result_disposition(
+    payload: &MessagesRequest,
+    round: &RoundOutcome,
+    retries: usize,
+) -> EmptyToolResultDisposition {
+    let is_invalid_empty_continuation = last_message_has_tool_result(payload)
+        && round.text.trim().is_empty()
+        && round.tool_uses.is_empty()
+        && round.stop_reason_override.is_none();
+    if !is_invalid_empty_continuation {
+        EmptyToolResultDisposition::Accept
+    } else if retries < MAX_EMPTY_TOOL_RESULT_RETRIES {
+        EmptyToolResultDisposition::Retry
+    } else {
+        EmptyToolResultDisposition::Fail
+    }
 }
 
 /// Buffer-decode one round of the upstream streaming response
@@ -90,6 +200,7 @@ async fn decode_round(
     let mut decoder = EventStreamDecoder::new();
 
     let mut text = String::new();
+    let mut thinking = String::new();
     // id -> (name, json_buffer), preserving the order of appearance
     let mut buffers: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
@@ -97,6 +208,7 @@ async fn decode_round(
     let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
     let mut context_input_tokens: Option<i32> = None;
     let mut credits = 0.0;
+    let mut last_metering: Option<MeteringEvent> = None;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = false;
 
@@ -126,6 +238,11 @@ async fn decode_round(
             };
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
+                Event::ReasoningContent(r) => {
+                    if let Some(t) = &r.text {
+                        thinking.push_str(t);
+                    }
+                }
                 Event::ToolUse(tu) => {
                     let entry = buffers.entry(tu.tool_use_id.clone()).or_insert_with(|| {
                         order.push(tu.tool_use_id.clone());
@@ -144,7 +261,10 @@ async fn decode_round(
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
                 }
-                Event::Metering(m) => credits += m.usage,
+                Event::Metering(m) => {
+                    credits += m.usage;
+                    last_metering = Some(m.clone());
+                }
                 Event::Exception { exception_type, .. } => {
                     if exception_type == "ContentLengthExceededException" {
                         stop_reason_override = Some("max_tokens".to_string());
@@ -176,9 +296,11 @@ async fn decode_round(
 
     RoundOutcome {
         text,
+        thinking,
         tool_uses,
         context_input_tokens,
         credits,
+        last_metering,
         stop_reason_override,
         stream_error,
         // Populated by the caller (run_round), which holds ConversionResult::known_tool_names.
@@ -203,8 +325,8 @@ async fn run_round(
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
-                ConversionError::UnsupportedModel(m) => {
-                    ("invalid_request_error", format!("unsupported model: {}", m))
+                ConversionError::InvalidModel(reason) => {
+                    ("invalid_request_error", format!("invalid model id: {}", reason))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
@@ -303,7 +425,7 @@ fn append_search_round(
     // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
     let mut user_content: Vec<Value> = Vec::new();
     for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
-        let query = tool_query(tu);
+        let query = tool_query(tu).unwrap_or_default();
         let summary = websearch::generate_search_summary(&query, results);
         user_content.push(json!({
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
@@ -500,7 +622,7 @@ fn build_flush_content(
         if tu.name == "web_search" {
             // INVARIANT: present as server_tool_use + web_search_tool_result,
             // never as a raw tool_use.
-            let query = tool_query(tu);
+            let query = tool_query(tu).unwrap_or_default();
             let (srv_id, _mcp) = websearch::create_mcp_request(&query);
             content.push(json!({
                 "type": "server_tool_use", "id": srv_id, "name": "web_search",
@@ -541,33 +663,104 @@ pub(super) async fn run_web_search_loop(
     let mut last_credential_id: u64 = 0;
     let mut last_context_input: Option<i32> = None;
     let mut total_credits = 0.0;
+    let mut latest_metering: Option<MeteringEvent> = None;
+    let mut all_thinking = String::new();
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
-        let (round, credential_id) = match run_round(
-            &provider,
-            &payload,
-            &hook,
-            fallback_input_tokens,
-            group.as_deref(),
-            tool_compatibility_mode,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(resp) => return resp,
+        let mut empty_retries = 0usize;
+        let round = loop {
+            let (round, credential_id) =
+                match run_round(
+                    &provider,
+                    &payload,
+                    &hook,
+                    fallback_input_tokens,
+                    group.as_deref(),
+                    tool_compatibility_mode,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(resp) => return resp,
+                };
+            last_credential_id = credential_id;
+            last_context_input = round.context_input_tokens.or(last_context_input);
+            total_credits += round.credits;
+            // 跨 round 保留最近一次 meteringEvent，多 round 时取最后一次
+            // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
+            if let Some(ref m) = round.last_metering {
+                latest_metering = Some(m.clone());
+            }
+
+            match empty_tool_result_disposition(&payload, &round, empty_retries) {
+                EmptyToolResultDisposition::Accept => {}
+                EmptyToolResultDisposition::Retry => {
+                    empty_retries += 1;
+                    tracing::warn!(
+                        round = round_idx,
+                        retry = empty_retries,
+                        "upstream returned an empty assistant turn after tool_result; retrying"
+                    );
+                    continue;
+                }
+                EmptyToolResultDisposition::Fail => {
+                    let final_input = last_context_input.unwrap_or(fallback_input_tokens);
+                    hook.record(
+                        last_credential_id,
+                        final_input,
+                        0,
+                        0,
+                        0,
+                        total_credits,
+                        "error",
+                    );
+                    tracing::error!(
+                        round = round_idx,
+                        "upstream repeated an empty assistant turn after tool_result"
+                    );
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorResponse::new(
+                            "upstream_error",
+                            "Upstream returned no assistant text or tool call after a tool result."
+                                .to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            }
+
+            // Only surface reasoning from the accepted attempt. An empty attempt is
+            // discarded and retried, so replaying its hidden reasoning would duplicate
+            // or contradict the successful attempt's summary.
+            if !round.thinking.is_empty() {
+                if !all_thinking.is_empty() {
+                    all_thinking.push_str("\n\n");
+                }
+                all_thinking.push_str(&round.thinking);
+            }
+
+            break round;
         };
-        last_credential_id = credential_id;
-        last_context_input = round.context_input_tokens.or(last_context_input);
-        total_credits += round.credits;
 
         if should_search_round(round_idx, &round.tool_uses) {
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
             let mut searched: Vec<Option<WebSearchResults>> =
                 Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
+                let Some(query) = tool_query(tu) else {
+                    log_invalid_web_search_input(tu);
+                    searched.push(None);
+                    continue;
+                };
+                log_normalized_web_search_query(tu, &query);
+                let (_id, mcp_request) = websearch::create_mcp_request(&query);
                 match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
+                    Err(e) if is_no_results_mcp_error(&e) => {
+                        tracing::warn!("web_search MCP returned no results; continuing with an empty result");
+                        searched.push(None);
+                    }
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
                         hook.record(
@@ -604,12 +797,20 @@ pub(super) async fn run_web_search_loop(
         let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
+                let Some(query) = tool_query(tu) else {
+                    log_invalid_web_search_input(tu);
+                    searched.push(None);
+                    continue;
+                };
+                log_normalized_web_search_query(tu, &query);
+                let (_id, mcp_request) = websearch::create_mcp_request(&query);
                 match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
+                    Err(e) if is_no_results_mcp_error(&e) => {
+                        tracing::warn!("web_search MCP returned no results in final round; continuing with an empty result");
+                        searched.push(None);
+                    }
                     Err(e) => {
-                        // Same pass-through discipline as the continue branch: a failed
-                        // search must surface as an error, never a silent success.
                         tracing::warn!("web_search MCP call (final round) failed: {}", e);
                         hook.record(
                             last_credential_id,
@@ -663,6 +864,7 @@ pub(super) async fn run_web_search_loop(
                 &stop_reason,
                 final_input,
                 output_tokens,
+                latest_metering.as_ref(),
             )
         } else {
             render_json(
@@ -671,6 +873,8 @@ pub(super) async fn run_web_search_loop(
                 &stop_reason,
                 final_input,
                 output_tokens,
+                &all_thinking,
+                latest_metering.as_ref(),
             )
         };
     }
@@ -696,14 +900,35 @@ pub(super) async fn run_web_search_loop(
 }
 
 /// Single JSON response (non-streaming)
+///
+/// `thinking`: optional out-of-band reasoning text. Emitted as a TOP-LEVEL
+/// `kiro_thinking` field (NOT a content block): Anthropic clients ignore
+/// unknown top-level fields and thus never replay an unsigned thinking block
+/// upstream, while the Responses translator picks it up for codex's
+/// reasoning-summary display.
 pub(crate) fn render_json(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    thinking: &str,
+    metering: Option<&MeteringEvent>,
 ) -> Response {
-    let body = json!({
+    let mut usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+    });
+    // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro 后端口径
+    // 一致的计费元数据；只在收到过 meteringEvent 时才追加。
+    if let Some(m) = metering {
+        usage["credit_usage"] = json!(m.usage);
+        usage["credit_unit"] = json!(m.unit);
+        usage["credit_unit_plural"] = json!(m.unit_plural);
+    }
+    let mut body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
         "role": "assistant",
@@ -711,13 +936,11 @@ pub(crate) fn render_json(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
-        }
+        "usage": usage
     });
+    if !thinking.is_empty() {
+        body["kiro_thinking"] = json!(thinking);
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -728,8 +951,9 @@ pub(crate) fn render_sse(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    metering: Option<&MeteringEvent>,
 ) -> Response {
-    let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens);
+    let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens, metering);
     let stream = stream::iter(
         events
             .into_iter()
@@ -751,6 +975,7 @@ fn build_sse_events(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    metering: Option<&MeteringEvent>,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
@@ -849,18 +1074,19 @@ fn build_sse_events(
         }
     }
 
-    events.push(SseEvent::new(
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason},
-            "usage": {"output_tokens": output_tokens}
-        }),
-    ));
-    events.push(SseEvent::new(
-        "message_stop",
-        json!({"type": "message_stop"}),
-    ));
+    let mut message_delta_usage = json!({ "output_tokens": output_tokens });
+    // 透传上游 meteringEvent 的 credit_* 字段（仅在拿到 meteringEvent 时）。
+    if let Some(m) = metering {
+        message_delta_usage["credit_usage"] = json!(m.usage);
+        message_delta_usage["credit_unit"] = json!(m.unit);
+        message_delta_usage["credit_unit_plural"] = json!(m.unit_plural);
+    }
+    events.push(SseEvent::new("message_delta", json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason},
+        "usage": message_delta_usage
+    })));
+    events.push(SseEvent::new("message_stop", json!({"type": "message_stop"})));
 
     events
 }
@@ -876,6 +1102,35 @@ mod tests {
             name: name.to_string(),
             input: json!({"query": "rust 2026"}),
         }
+    }
+
+    fn tu_with_input(input: Value) -> CompletedToolUse {
+        CompletedToolUse {
+            id: "toolu_web_search".to_string(),
+            name: "web_search".to_string(),
+            input,
+        }
+    }
+
+    #[test]
+    fn tool_query_normalizes_supported_input_shapes() {
+        assert_eq!(tool_query(&tu_with_input(json!({"query": "  rust 2026  "}))), Some("rust 2026".to_string()));
+        assert_eq!(tool_query(&tu_with_input(json!({"search_query": "南京演唱会"}))), Some("南京演唱会".to_string()));
+        assert_eq!(tool_query(&tu_with_input(json!({"queries": ["", "上海天气"]}))), Some("上海天气".to_string()));
+        assert_eq!(tool_query(&tu_with_input(json!({"query": {"text": "Paris weather"}}))), Some("Paris weather".to_string()));
+    }
+
+    #[test]
+    fn tool_query_rejects_missing_or_non_string_input() {
+        assert_eq!(tool_query(&tu_with_input(json!({"query": "   "}))), None);
+        assert_eq!(tool_query(&tu_with_input(json!({"query": 42}))), None);
+        assert_eq!(tool_query(&tu_with_input(json!({"other": true}))), None);
+    }
+
+    #[test]
+    fn no_results_mcp_error_is_nonfatal() {
+        assert!(is_no_results_mcp_error(&anyhow::anyhow!("MCP error: -32602 - Tool returned no results")));
+        assert!(!is_no_results_mcp_error(&anyhow::anyhow!("MCP error: -32602 - Invalid tool parameters provided")));
     }
 
     /// Build a known-tool-names set for build_flush_content tests.
@@ -913,6 +1168,134 @@ mod tests {
         // Skip: no tool_use at all (plain-text answer) -> terminate
         let empty: Vec<CompletedToolUse> = vec![];
         assert!(!should_search_round(0, &empty));
+    }
+
+    fn round_outcome(text: &str, tool_uses: Vec<CompletedToolUse>) -> RoundOutcome {
+        RoundOutcome {
+            text: text.to_string(),
+            thinking: String::new(),
+            tool_uses,
+            context_input_tokens: None,
+            credits: 0.0,
+            last_metering: None,
+            stop_reason_override: None,
+            stream_error: false,
+            known_tool_names: std::collections::HashSet::new(),
+            tool_name_map: std::collections::HashMap::new(),
+        }
+    }
+
+    fn payload_with_last_block(block: Value) -> MessagesRequest {
+        MessagesRequest {
+            model: "gpt-5.6-terra".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([block]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            force_web_search_loop: false,
+        }
+    }
+
+    #[test]
+    fn empty_round_after_tool_result_retries_once_then_fails() {
+        let payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("", vec![]), 0),
+            EmptyToolResultDisposition::Retry
+        );
+        assert_eq!(
+            empty_tool_result_disposition(
+                &payload,
+                &round_outcome("", vec![]),
+                MAX_EMPTY_TOOL_RESULT_RETRIES,
+            ),
+            EmptyToolResultDisposition::Fail
+        );
+    }
+
+    #[test]
+    fn text_or_tool_call_after_tool_result_is_not_retried() {
+        let payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("finished", vec![]), 0),
+            EmptyToolResultDisposition::Accept
+        );
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("", vec![tu("exec")]), 0),
+            EmptyToolResultDisposition::Accept
+        );
+    }
+
+    #[test]
+    fn empty_initial_round_is_not_misclassified_as_tool_continuation() {
+        let payload = payload_with_last_block(json!({"type": "text", "text": "hello"}));
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("", vec![]), 0),
+            EmptyToolResultDisposition::Accept
+        );
+    }
+
+    #[test]
+    fn whitespace_and_reasoning_only_after_tool_result_is_retried() {
+        let payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        let mut round = round_outcome(" \n\t", vec![]);
+        round.thinking = "hidden reasoning without a client-visible continuation".to_string();
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round, 0),
+            EmptyToolResultDisposition::Retry
+        );
+    }
+
+    #[test]
+    fn terminal_limit_reason_after_tool_result_is_not_retried() {
+        let payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        let mut round = round_outcome("", vec![]);
+        round.stop_reason_override = Some("max_tokens".to_string());
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round, 0),
+            EmptyToolResultDisposition::Accept
+        );
+    }
+
+    #[test]
+    fn only_the_last_message_determines_tool_continuation() {
+        let mut payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        payload.messages.push(Message {
+            role: "user".to_string(),
+            content: json!([{"type": "text", "text": "new user turn"}]),
+        });
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("", vec![]), 0),
+            EmptyToolResultDisposition::Accept
+        );
     }
 
     #[test]
@@ -983,7 +1366,7 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5);
+        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5, None);
 
         // Must contain message_start / message_delta(stop_reason) / message_stop
         assert_eq!(events.first().unwrap().event, "message_start");
@@ -1569,5 +1952,111 @@ mod tests {
             "distinct inputs must both be kept. content={:?}",
             content
         );
+    }
+
+    // ---- credit_usage 透传：run_web_search_loop 路径 ----
+
+    fn metering_event(usage: f64) -> MeteringEvent {
+        MeteringEvent {
+            unit: "credit".to_string(),
+            unit_plural: "credits".to_string(),
+            usage,
+        }
+    }
+
+    #[test]
+    fn render_json_carries_credit_fields_when_metering_present() {
+        let content = vec![json!({"type": "text", "text": "ok"})];
+        let metering = metering_event(0.42);
+        let resp = render_json(
+            "claude-opus-4-7",
+            content,
+            "end_turn",
+            10,
+            5,
+            "",
+            Some(&metering),
+        );
+        // 把 Response 的 body 序列化为 JSON 再断言。
+        let body = resp.into_body();
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(body, 64 * 1024).await.unwrap()
+        });
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let usage = &v["usage"];
+        assert_eq!(usage["credit_usage"], json!(0.42));
+        assert_eq!(usage["credit_unit"], json!("credit"));
+        assert_eq!(usage["credit_unit_plural"], json!("credits"));
+        // 原有字段保持原样
+        assert_eq!(usage["input_tokens"], json!(10));
+        assert_eq!(usage["output_tokens"], json!(5));
+    }
+
+    #[test]
+    fn render_json_omits_credit_fields_without_metering() {
+        let content = vec![json!({"type": "text", "text": "ok"})];
+        let resp = render_json(
+            "claude-opus-4-7",
+            content,
+            "end_turn",
+            10,
+            5,
+            "",
+            None,
+        );
+        let body = resp.into_body();
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(body, 64 * 1024).await.unwrap()
+        });
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let usage = &v["usage"];
+        assert!(usage.get("credit_usage").is_none());
+        assert!(usage.get("credit_unit").is_none());
+        assert!(usage.get("credit_unit_plural").is_none());
+    }
+
+    #[test]
+    fn build_sse_events_carries_credit_fields_in_message_delta() {
+        let content = vec![json!({"type": "text", "text": "ok"})];
+        let metering = metering_event(0.99);
+        let events = build_sse_events(
+            "claude-opus-4-7",
+            content,
+            "end_turn",
+            10,
+            5,
+            Some(&metering),
+        );
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("must have message_delta");
+        let usage = &delta.data["usage"];
+        assert_eq!(usage["credit_usage"], json!(0.99));
+        assert_eq!(usage["credit_unit"], json!("credit"));
+        assert_eq!(usage["credit_unit_plural"], json!("credits"));
+        // 原有字段保持原样
+        assert_eq!(usage["output_tokens"], json!(5));
+    }
+
+    #[test]
+    fn build_sse_events_omits_credit_fields_without_metering() {
+        let content = vec![json!({"type": "text", "text": "ok"})];
+        let events = build_sse_events(
+            "claude-opus-4-7",
+            content,
+            "end_turn",
+            10,
+            5,
+            None,
+        );
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("must have message_delta");
+        let usage = &delta.data["usage"];
+        assert!(usage.get("credit_usage").is_none());
+        assert!(usage.get("credit_unit").is_none());
+        assert!(usage.get("credit_unit_plural").is_none());
     }
 }

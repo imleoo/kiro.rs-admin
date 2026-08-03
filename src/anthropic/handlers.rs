@@ -1,5 +1,6 @@
 //! Anthropic API Handler 函数
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::time::Instant;
 
@@ -8,9 +9,11 @@ use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, TraceStage, outcome,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
+use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::token_manager::ModelDiscoveryError;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -252,15 +255,20 @@ impl TraceSink for RequestTracer {
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
 fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
-    Some(match last.as_str() {
+    Some(canonical_attempt_outcome(&last))
+}
+
+fn canonical_attempt_outcome(value: &str) -> &'static str {
+    match value {
         outcome::QUOTA_EXHAUSTED => outcome::QUOTA_EXHAUSTED,
         outcome::ACCOUNT_THROTTLED => outcome::ACCOUNT_THROTTLED,
+        outcome::ACCOUNT_SUSPENDED => outcome::ACCOUNT_SUSPENDED,
         outcome::AUTH_FAILED => outcome::AUTH_FAILED,
         outcome::TRANSIENT => outcome::TRANSIENT,
         outcome::NETWORK_ERROR => outcome::NETWORK_ERROR,
         outcome::BAD_REQUEST => outcome::BAD_REQUEST,
         _ => outcome::UNKNOWN,
-    })
+    }
 }
 
 /// Image-budget warning threshold (in raw base64 chars, not decoded bytes).
@@ -405,232 +413,179 @@ fn resolve_usage_input_tokens(
     context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
 }
 
-fn available_models() -> Vec<Model> {
-    let model = |id: &str, display_name: &str, owned_by: &str, max_tokens: i32| Model {
-        id: id.to_string(),
+fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
+    if max_tokens <= 0 {
+        Err(ErrorResponse::new(
+            "invalid_request_error",
+            "max_tokens must be greater than 0",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn merge_token_limits(target: &mut Option<TokenLimits>, incoming: Option<TokenLimits>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    match target {
+        Some(target) => {
+            target.max_input_tokens = target.max_input_tokens.max(incoming.max_input_tokens);
+            target.max_output_tokens = target.max_output_tokens.max(incoming.max_output_tokens);
+        }
+        None => *target = Some(incoming),
+    }
+}
+
+fn infer_model_owner(model_id: &str) -> &'static str {
+    let id = model_id.to_ascii_lowercase();
+    if id.starts_with("claude-") {
+        "anthropic"
+    } else if id.starts_with("gpt-")
+        || id.starts_with("chatgpt-")
+        || id.starts_with("o1-")
+        || id.starts_with("o3-")
+        || id.starts_with("o4-")
+    {
+        "openai"
+    } else {
+        "kiro"
+    }
+}
+
+fn model_from_upstream(upstream: UpstreamModel) -> Model {
+    let max_tokens = upstream
+        .token_limits
+        .as_ref()
+        .and_then(|limits| limits.max_output_tokens)
+        .and_then(|limit| i32::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(64_000);
+    Model {
+        display_name: upstream
+            .model_name
+            .clone()
+            .unwrap_or_else(|| upstream.model_id.clone()),
+        owned_by: infer_model_owner(&upstream.model_id).to_string(),
+        id: upstream.model_id,
         object: "model".to_string(),
-        created: 1781481600,
-        owned_by: owned_by.to_string(),
-        display_name: display_name.to_string(),
+        created: 0,
         model_type: "chat".to_string(),
         max_tokens,
-    };
+    }
+}
 
-    let mut models = vec![
-        model("auto", "Auto", "kiro", 64000),
-        model("claude-sonnet-5", "Claude Sonnet 5", "anthropic", 64000),
-        model("claude-opus-4.8", "Claude Opus 4.8", "anthropic", 64000),
-        model("claude-opus-4.7", "Claude Opus 4.7", "anthropic", 64000),
-        model("claude-opus-4.6", "Claude Opus 4.6", "anthropic", 64000),
-        model("claude-sonnet-4.6", "Claude Sonnet 4.6", "anthropic", 64000),
-        model("claude-opus-4.5", "Claude Opus 4.5", "anthropic", 64000),
-        model("claude-sonnet-4.5", "Claude Sonnet 4.5", "anthropic", 64000),
-        model("claude-sonnet-4", "Claude Sonnet 4", "anthropic", 64000),
-        model("claude-haiku-4.5", "Claude Haiku 4.5", "anthropic", 64000),
-        model("deepseek-3.2", "DeepSeek v3.2", "deepseek", 64000),
-        model("minimax-m2.5", "MiniMax M2.5", "minimax", 64000),
-        model("minimax-m2.1", "MiniMax M2.1", "minimax", 64000),
-        model("glm-5", "GLM 5", "zhipu", 64000),
-        model("qwen3-coder-next", "Qwen3 Coder Next", "qwen", 64000),
-        Model {
-            id: "claude-fable-5".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-fable-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-5".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ];
+fn aggregate_available_models_with_custom(
+    upstream_models: Vec<UpstreamModel>,
+    custom_models: &[crate::model::config::CustomModel],
+) -> Vec<Model> {
+    let mut merged_upstream: BTreeMap<String, UpstreamModel> = BTreeMap::new();
+    for incoming in upstream_models {
+        match merged_upstream.get_mut(&incoming.model_id) {
+            Some(existing) => {
+                if existing.model_name.is_none() {
+                    existing.model_name = incoming.model_name;
+                }
+                if existing.description.is_none() {
+                    existing.description = incoming.description;
+                }
+                merge_token_limits(&mut existing.token_limits, incoming.token_limits);
+            }
+            None => {
+                merged_upstream.insert(incoming.model_id.clone(), incoming);
+            }
+        }
+    }
 
-    let mut seen = std::collections::HashSet::new();
-    models.retain(|model| seen.insert(model.id.clone()));
-    models
+    let mut models: BTreeMap<String, Model> = BTreeMap::new();
+    for upstream in merged_upstream.into_values() {
+        let model = model_from_upstream(upstream);
+        models.insert(model.id.clone(), model);
+    }
+
+    // 自定义别名最后写入，同名时其展示元数据优先于动态条目。
+    for custom in custom_models {
+        let model = Model {
+            id: custom.id.clone(),
+            object: "model".to_string(),
+            created: 0,
+            owned_by: custom
+                .owned_by
+                .clone()
+                .unwrap_or_else(|| "custom".to_string()),
+            display_name: custom
+                .display_name
+                .clone()
+                .unwrap_or_else(|| custom.id.clone()),
+            model_type: "chat".to_string(),
+            max_tokens: custom.max_tokens.unwrap_or(64_000),
+        };
+        models.insert(model.id.clone(), model);
+    }
+
+    models.into_values().collect()
+}
+
+fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
+    aggregate_available_models_with_custom(upstream_models, crate::model::custom_models::all())
 }
 
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
+) -> Response {
     tracing::info!("Received GET /v1/models request");
 
-    let models = available_models();
+    let Some(provider) = &state.kiro_provider else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "Kiro API provider not configured",
+            )),
+        )
+            .into_response();
+    };
+
+    let upstream = match provider
+        .token_manager()
+        .discover_models_for_group(key_ctx.group.as_deref())
+        .await
+    {
+        Ok(models) => models,
+        Err(ModelDiscoveryError::NoAvailableCredentials) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::new(
+                    "service_unavailable",
+                    "No available credentials for this API key",
+                )),
+            )
+                .into_response();
+        }
+        Err(error @ ModelDiscoveryError::ColdStartFailed { .. }) => {
+            tracing::warn!("动态模型列表加载失败: {}", error);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Unable to load available models from upstream",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let models = aggregate_available_models(upstream);
 
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
     })
+    .into_response()
 }
 
 /// POST /v1/messages
@@ -653,6 +608,9 @@ pub async fn post_messages(
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
         tracing::warn!(
             image_count = %img_stats.count,
@@ -735,8 +693,8 @@ pub async fn post_messages(
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
+                ConversionError::InvalidModel(reason) => {
+                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
@@ -1203,6 +1161,10 @@ async fn handle_non_stream_request(
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
+    // 最近一次 meteringEvent 的完整 payload，用于在响应体 usage 中透传
+    // credit_usage / credit_unit / credit_unit_plural 字段，与 /v1/messages
+    // 流式（message_delta）行为一致；如果上游多次下发则取最后一次。
+    let mut metering: Option<crate::kiro::model::events::MeteringEvent> = None;
 
     // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
@@ -1264,10 +1226,16 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
-                        Event::Metering(metering) => {
+                        Event::Metering(event_metering) => {
                             // 上游只下发 credit；token / cache 字段不存在
-                            credits += metering.usage;
-                            tracing::debug!("metering credits +{:.6}", metering.usage);
+                            credits += event_metering.usage;
+                            tracing::debug!(
+                                usage = event_metering.usage,
+                                unit = %event_metering.unit,
+                                unit_plural = %event_metering.unit_plural,
+                                "metering credits +{:.6}", event_metering.usage
+                            );
+                            metering = Some(event_metering);
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -1340,6 +1308,19 @@ async fn handle_non_stream_request(
         cache_usage.split_against_total(total_input_tokens);
 
     // 构建 Anthropic 响应
+    let mut usage_json = json!({
+        "input_tokens": final_input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_tokens,
+        "cache_read_input_tokens": cache_read_tokens
+    });
+    // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
+    // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
+    if let Some(m) = &metering {
+        usage_json["credit_usage"] = json!(m.usage);
+        usage_json["credit_unit"] = json!(m.unit);
+        usage_json["credit_unit_plural"] = json!(m.unit_plural);
+    }
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -1348,12 +1329,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": cache_creation_tokens,
-            "cache_read_input_tokens": cache_read_tokens
-        }
+        "usage": usage_json
     });
 
     // decode=读响应体 + 解析事件流的耗时（非流式路径）
@@ -1529,6 +1505,9 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
@@ -1604,8 +1583,8 @@ pub async fn post_messages_cc(
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
+                ConversionError::InvalidModel(reason) => {
+                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
@@ -1946,6 +1925,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn account_suspended_attempt_is_preserved_as_request_error_type() {
+        assert_eq!(
+            canonical_attempt_outcome(outcome::ACCOUNT_SUSPENDED),
+            outcome::ACCOUNT_SUSPENDED
+        );
+    }
+
+    #[test]
     fn bedrock_client_validation_errors_map_to_400() {
         // 客户端校验错误必须映射为 400（而非 5xx），否则会被 provider 当作上游
         // 瞬态错误触发冷却，放大成 503 风暴。识别逻辑集中在 endpoint 层。
@@ -1983,17 +1970,13 @@ mod tests {
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            resp.headers().get(header::RETRY_AFTER).unwrap(),
-            "1800"
-        );
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "1800");
     }
 
     #[test]
     fn upstream_rate_limit_drops_invalid_retry_after() {
-        let err = crate::kiro::error::UpstreamRateLimitError::new(Some(
-            "not-a-retry-delay".to_string(),
-        ));
+        let err =
+            crate::kiro::error::UpstreamRateLimitError::new(Some("not-a-retry-delay".to_string()));
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2071,17 +2054,40 @@ mod tests {
     }
 
     #[test]
-    fn available_models_include_opus_4_7_variants() {
-        let models = available_models();
+    fn dynamic_models_do_not_synthesize_claude_thinking_alias() {
+        let models = aggregate_available_models(vec![UpstreamModel {
+            model_id: "claude-opus-5".to_string(),
+            model_name: Some("Claude Opus 5".to_string()),
+            description: None,
+            token_limits: None,
+        }]);
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
-        assert!(ids.contains(&"claude-opus-4-7"));
-        assert!(ids.contains(&"claude-opus-4-7-thinking"));
+        assert!(ids.contains(&"claude-opus-5"));
+        assert!(!ids.contains(&"claude-opus-5-thinking"));
     }
 
     #[test]
-    fn available_models_include_native_kiro_models() {
-        let models = available_models();
+    fn available_models_include_discovered_native_kiro_models() {
+        let upstream_models: Vec<UpstreamModel> = [
+            "auto",
+            "deepseek-3.2",
+            "minimax-m2.5",
+            "minimax-m2.1",
+            "glm-5",
+            "qwen3-coder-next",
+            "claude-sonnet-4.6",
+            "claude-opus-4.8",
+        ]
+        .into_iter()
+        .map(|id| UpstreamModel {
+            model_id: id.to_string(),
+            model_name: None,
+            description: None,
+            token_limits: None,
+        })
+        .collect();
+        let models = aggregate_available_models(upstream_models);
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
         assert!(ids.contains(&"auto"));
@@ -2096,7 +2102,20 @@ mod tests {
 
     #[test]
     fn available_models_have_unique_ids() {
-        let models = available_models();
+        let models = aggregate_available_models(vec![
+            UpstreamModel {
+                model_id: "claude-opus-4.8".to_string(),
+                model_name: Some("Claude Opus 4.8".to_string()),
+                description: None,
+                token_limits: None,
+            },
+            UpstreamModel {
+                model_id: "claude-opus-4.8".to_string(),
+                model_name: None,
+                description: Some("dup entry from another credential".to_string()),
+                token_limits: None,
+            },
+        ]);
         let mut seen = std::collections::HashSet::new();
 
         for model in models {
@@ -2165,13 +2184,68 @@ mod tests {
     }
 
     #[test]
-    fn available_models_include_4_8_variants() {
-        let models = available_models();
-        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+    fn dynamic_models_merge_metadata_and_do_not_use_input_limit_as_output_limit() {
+        let models = aggregate_available_models(vec![
+            UpstreamModel {
+                model_id: "glm-5".to_string(),
+                model_name: None,
+                description: Some("first".to_string()),
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(200_000),
+                    max_output_tokens: None,
+                }),
+            },
+            UpstreamModel {
+                model_id: "glm-5".to_string(),
+                model_name: Some("GLM 5".to_string()),
+                description: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(32_000),
+                }),
+            },
+        ]);
 
-        assert!(ids.contains(&"claude-opus-4-8"));
-        assert!(ids.contains(&"claude-opus-4-8-thinking"));
-        assert!(ids.contains(&"claude-sonnet-4-8"));
-        assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].display_name, "GLM 5");
+        assert_eq!(models[0].owned_by, "kiro");
+        assert_eq!(models[0].max_tokens, 32_000);
+    }
+
+    #[test]
+    fn custom_model_metadata_overrides_dynamic_collision() {
+        let custom = crate::model::config::CustomModel {
+            id: "gpt-next".to_string(),
+            backend_id: "gpt-next".to_string(),
+            display_name: Some("Configured GPT".to_string()),
+            context_window: Some(500_000),
+            max_tokens: Some(12_345),
+            supports_reasoning: Some(true),
+            owned_by: Some("configured-owner".to_string()),
+        };
+        let models = aggregate_available_models_with_custom(
+            vec![UpstreamModel {
+                model_id: "gpt-next".to_string(),
+                model_name: Some("Upstream GPT".to_string()),
+                description: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(300_000),
+                    max_output_tokens: Some(64_000),
+                }),
+            }],
+            &[custom],
+        );
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].display_name, "Configured GPT");
+        assert_eq!(models[0].owned_by, "configured-owner");
+        assert_eq!(models[0].max_tokens, 12_345);
+    }
+
+    #[test]
+    fn max_tokens_must_be_positive() {
+        assert!(validate_max_tokens(1).is_ok());
+        assert!(validate_max_tokens(0).is_err());
+        assert!(validate_max_tokens(-1).is_err());
     }
 }
