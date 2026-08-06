@@ -71,6 +71,46 @@ upstream 那套变成了完全未被引用、编译器也不会警告的**孤儿
 高风险文件（尤其是这种"从字符串匹配重写成结构化解析"的函数）单独提高 review 强度或让人工
 逐条对照旧实现的分支覆盖面。
 
+### RPM 限流：per-account 可配置 vs 全局单一开关
+
+本仓库在更早的 `merge/upstream-2026-08-03` 合并里，已经独立实现了一套账号级 RPM（每分钟
+请求数）主动限流：`KiroCredentials.rpm_limit` 是**每个凭据自己的字段**（随凭据编辑/导入
+设置，`0` = 不限速），调度侧用 `is_rpm_exceeded`/`rpm_window_count`（`token_manager.rs`
+自由函数）判断，`record_request` 由 `provider.rs` 在真正发起上游请求时调用。这套设计当时
+**没有被记录进本文档**，导致 2026-08 合并 upstream-kiro 时才发现是一处未文档化的架构分歧。
+
+`upstream-kiro` 后来（commit `baa60e9`）也做了等价功能，但形状不同：`account_rpm_limit_enabled`/
+`account_rpm_limit` 是**全局单一开关 + 单一上限**，对所有账号一视同仁，且额外走 Admin API
+（`GET|PUT /api/admin/config/account-rpm-limit`）+ 顶栏独立 UI 卡片。2026-08 合并时评估后
+**决定不采纳**上游这条全局路线——本仓库的"每账号可配置"设计严格更灵活（能模拟全局限速，
+也能单独放开某个账号），upstream 的全局开关是它的子集。合并时把 `token_manager.rs`（12 处
+冲突）、`model/config.rs`、`admin/{handlers,router,service,types}.rs`、
+`topbar-tools.tsx`、`use-credentials.ts`、`admin-ui/src/api/credentials.ts` 里 upstream
+一侧的 RPM 改动全部丢弃，只保留本地实现；upstream 在 `topbar-tools.tsx` 里新增的
+`AccountRpmLimitButton`/`AccountRpmLimitPanel`/`AccountRpmLimitCompactItems` 等组件因为
+只在被丢弃的这条路径里被引用，作为孤儿代码一并删除。
+
+upstream 同批次的后续提交 `da4829d`（"fix: enforce RPM limits and preserve failed
+deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rpm_exceeded` 检查和
+`record_request` 记账不是原子的，并发请求可能一起穿过检查后一起记账导致短时超过上限；
+修法是把 `record_request` 改成返回 `bool`、在拿到 token 成功后在同一把锁内原子重检，
+失败则重新选号；额度耗尽时返回带 `Retry-After` 的类型化 429，而不是裸 `bail!`。
+
+**本仓库的 per-account 实现目前存在同一类问题**（`is_rpm_exceeded` 检查与
+`provider.rs` 里的 `record_request` 调用点是分离的两步，非原子），且全账号 RPM 耗尽时
+的错误路径未确认是否已是类型化 429 + `Retry-After`。这不是这次合并引入的回归（本地设计
+一直如此），不在"合并上游"范围内顺手改掉，但记在这里作为后续独立待办：
+1. 评估 `is_rpm_exceeded` 检查 + `record_request` 记账之间的 TOCTOU 窗口是否需要收紧
+   为原子操作（可参考 upstream `da4829d` 的思路，但要适配本地 per-credential 而非全局的
+   数据结构）。
+2. 确认全账号 RPM 耗尽时返回的错误是否已经是类型化限流错误（`UpstreamRateLimitError` 或
+   等价类型）并带 `Retry-After`，而不是被吞成普通 5xx/无 Retry-After 的 429。
+
+**合并上游时的检查点**：如果未来 upstream-kiro 再次改动 `account_rpm_limit_enabled`/
+`account_rpm_limit`/`rpm_window`/`rpm_exceeded` 这套全局 RPM 逻辑，先确认本地
+`rpm_limit`/`is_rpm_exceeded`/`rpm_window_count`/`recent_requests` 这套 per-account
+逻辑是否已被顺手替换掉——不要不假思索接受全局开关这条路线。
+
 ## 自定义功能域
 
 以下按功能域列出相对 `upstream-kiro/master`（原始上游）的主要差异，涉及的关键文件供合并冲突时定位。
