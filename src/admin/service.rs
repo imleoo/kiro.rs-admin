@@ -506,6 +506,13 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0);
 
+    // 凭据添加时间 → 毫秒时间戳（缺失/解析失败时回退到导出当刻，兼容旧凭据）
+    let created_at_ms = cred
+        .created_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis());
+
     // 订阅：最小可用结构（type + 原始 title）
     let subscription = serde_json::json!({
         "type": subscription_type_from_title(cred.subscription_title.as_deref()),
@@ -553,7 +560,7 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
         usage,
         tags: Vec::new(),
         status,
-        created_at: now_ms,
+        created_at: created_at_ms.unwrap_or(now_ms),
         last_used_at: now_ms,
     })
 }

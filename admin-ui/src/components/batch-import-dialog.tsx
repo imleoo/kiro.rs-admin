@@ -77,6 +77,8 @@ interface CredentialInput {
   expiresAt?: string
   expires_at?: string
   expired?: string
+  createdAt?: string
+  created_at?: string
   userId?: string | null
   user_id?: string | null
   startUrl?: string
@@ -120,7 +122,8 @@ function preferStringArray(obj: Record<string, unknown>, ...keys: string[]): str
   return undefined
 }
 
-function normalizeExpiresAt(value: unknown): string | undefined {
+/** 归一化时间戳字段：兼容毫秒时间戳（数字）与已经是字符串的情况。expiresAt / createdAt 共用。 */
+function normalizeTimestamp(value: unknown): string | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {
     const date = new Date(value)
     return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
@@ -176,7 +179,8 @@ function normalizeImportEntry(raw: unknown): CredentialInput {
     refreshToken: preferString(merged, 'refreshToken', 'refresh_token'),
     accessToken,
     profileArn: preferString(merged, 'profileArn', 'profile_arn'),
-    expiresAt: normalizeExpiresAt(merged.expiresAt ?? merged.expires_at ?? merged.expired),
+    expiresAt: normalizeTimestamp(merged.expiresAt ?? merged.expires_at ?? merged.expired),
+    createdAt: normalizeTimestamp(merged.createdAt ?? merged.created_at),
     clientId: preferString(merged, 'clientId', 'client_id'),
     clientSecret: preferString(merged, 'clientSecret', 'client_secret'),
     region: preferString(merged, 'region'),
@@ -446,6 +450,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
               groups: mergeGroups(groups, cred.groups),
+              createdAt: cred.createdAt,
             },
           })
         } else {
@@ -523,6 +528,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
               groups: mergeGroups(groups, cred.groups),
+              createdAt: cred.createdAt,
             },
           })
         }

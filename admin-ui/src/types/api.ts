@@ -165,6 +165,8 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
+  /** 凭据添加（创建）时间（RFC3339 格式）；导入自带时间时可携带以保留原始值 */
+  createdAt?: string
 }
 
 // 添加凭据响应
