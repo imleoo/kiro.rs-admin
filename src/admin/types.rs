@@ -239,6 +239,14 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+
+    /// 凭据添加（创建）时间（RFC3339 格式，可选）
+    ///
+    /// 导入自带该字段时（如 KAM 迁移导出）予以保留；未提供时由
+    /// `token_manager.add_credential` 落库时取当前时间。
+    #[serde(default)]
+    #[serde(alias = "created_at")]
+    pub created_at: Option<String>,
 }
 
 fn default_auth_method() -> String {

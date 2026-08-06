@@ -228,7 +228,9 @@ function credentialHasStatus(
   const quotaExceeded =
     (!c.disabled && quotaByBalance) ||
     (c.disabled && c.disabledReason === "QuotaExceeded");
-  const throttled = !c.disabled && (c.throttledRemainingSecs ?? 0) > 0;
+  const throttled =
+    !c.disabled &&
+    ((c.throttledRemainingSecs ?? 0) > 0 || (c.rateLimitedRemainingMs ?? 0) > 0);
   switch (key) {
     case "current":
       return c.isCurrent;
@@ -2121,6 +2123,30 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               <p className="text-sm text-muted-foreground">
                 暂无凭据，点击右上角“添加凭据”开始
               </p>
+            </CardContent>
+          </Card>
+        ) : filteredCredentials.length === 0 ? (
+          <Card>
+            <CardContent className="py-16 text-center">
+              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
+                <Server className="h-5 w-5" />
+              </div>
+              <p className="text-sm text-muted-foreground">
+                没有符合当前筛选条件的凭据
+              </p>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="mt-3"
+                onClick={() => {
+                  setGroupFilter("");
+                  setTierFilter(new Set());
+                  setSearchQuery("");
+                  setHiddenStatuses(new Set());
+                }}
+              >
+                清除筛选条件
+              </Button>
             </CardContent>
           </Card>
         ) : (

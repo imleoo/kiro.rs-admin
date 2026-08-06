@@ -1408,8 +1408,8 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
-            // 创建时间由 token_manager.add_credential 在入库时统一写入
-            created_at: None,
+            // 导入自带创建时间则保留，否则由 token_manager.add_credential 落库时补齐
+            created_at: req.created_at,
         };
 
         // 调用 token_manager 添加凭据
