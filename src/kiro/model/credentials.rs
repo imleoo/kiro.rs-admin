@@ -870,6 +870,16 @@ pub fn is_placeholder_profile_arn(arn: &str) -> bool {
     arn == BUILDER_ID_PROFILE_ARN
 }
 
+/// 从 profileArn 中解析出账号实际所属的区域（形如
+/// `arn:aws:codewhisperer:{region}:{account}:profile/{id}` 的第 4 段）。
+/// 占位符 ARN 或格式异常时返回 `None`。
+pub fn region_from_profile_arn(arn: &str) -> Option<&str> {
+    if is_placeholder_profile_arn(arn) {
+        return None;
+    }
+    arn.splitn(5, ':').nth(3).filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 impl KiroCredentials {
     fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
@@ -1072,6 +1082,16 @@ mod tests {
         assert!(!is_placeholder_profile_arn(
             "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123"
         ));
+    }
+
+    #[test]
+    fn test_region_from_profile_arn() {
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer:eu-central-1:304896042436:profile/UKNK4DPERYPE"),
+            Some("eu-central-1")
+        );
+        assert_eq!(region_from_profile_arn(BUILDER_ID_PROFILE_ARN), None);
+        assert_eq!(region_from_profile_arn("not-an-arn"), None);
     }
 
     #[test]

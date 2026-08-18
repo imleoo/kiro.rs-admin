@@ -3490,6 +3490,7 @@ impl MultiTokenManager {
         // 已有真实 ARN（含 Social 共享 ARN）→ 直接用，无需查询
         if let Some(arn) = credentials.profile_arn.as_deref() {
             if !is_placeholder_profile_arn(arn) {
+                self.auto_fix_api_region(id, arn);
                 return Ok(Some(arn.to_string()));
             }
         }
@@ -3517,7 +3518,46 @@ impl MultiTokenManager {
         }
         tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
 
+        self.auto_fix_api_region(id, &arn);
+
         Ok(Some(arn))
+    }
+
+    /// 探测 profileArn 归属区域与凭据当前 `apiRegion` 是否一致；不一致（含未设置）时
+    /// 自动写回并持久化，避免请求区域与 profile 区域错配导致上游返回
+    /// `400 Improperly formed request.`。
+    fn auto_fix_api_region(&self, id: u64, arn: &str) {
+        use crate::kiro::model::credentials::region_from_profile_arn;
+
+        let Some(arn_region) = region_from_profile_arn(arn) else {
+            return;
+        };
+
+        let needs_fix = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .is_some_and(|e| e.credentials.api_region.as_deref() != Some(arn_region))
+        };
+        if !needs_fix {
+            return;
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials.api_region = Some(arn_region.to_string());
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("apiRegion 自动校正后持久化失败（不影响本次请求）: {}", e);
+        }
+        tracing::info!(
+            "凭据 #{} apiRegion 与 profileArn 区域不一致，已自动校正为: {}",
+            id,
+            arn_region
+        );
     }
 
     /// 获取指定凭据的使用额度（Admin API）
