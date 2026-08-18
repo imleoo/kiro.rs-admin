@@ -155,6 +155,37 @@ function parseImportEntries(parsed: unknown): unknown[] {
 }
 
 /**
+ * 纯文本「每行一个 `ksk_` API Key」批量导入的回退解析。
+ * 仅当输入非 JSON、且至少一行以 `ksk_` 开头时生效；每个非空行归一化为一条
+ * `{ kiroApiKey }` 记录，复用既有的去重与导入流程。不满足条件时返回 null，
+ * 交由调用方保留原始 JSON 解析错误。
+ */
+function parsePlainTextApiKeys(text: string): unknown[] | null {
+  const lines = text
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+  if (lines.length === 0 || !lines.every(line => line.startsWith('ksk_'))) {
+    return null
+  }
+  return lines.map(line => ({ kiroApiKey: line }))
+}
+
+/**
+ * 解析批量导入文本框输入：优先按 JSON 解析；解析失败时回退尝试纯文本
+ * 「每行一个 ksk_ API Key」格式；两者都不满足则抛出原始 JSON 解析错误。
+ */
+function parseImportInput(text: string): unknown[] {
+  try {
+    return parseImportEntries(JSON.parse(text))
+  } catch (jsonError) {
+    const plainText = parsePlainTextApiKeys(text)
+    if (plainText) return plainText
+    throw jsonError
+  }
+}
+
+/**
  * 归一化单条导入条目，兼容两种格式：
  * 1. 扁平 `credentials.json` 格式（字段直接位于顶层）；
  * 2. 嵌套「Account / Kiro Account Manager」导出格式（账号字段在顶层，
@@ -343,10 +374,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   }
 
   const handleBatchImport = async (verify: boolean) => {
-    // 先单独解析 JSON，给出精准的错误提示
+    // 先单独解析 JSON（失败时回退纯文本 ksk_ 逐行格式），给出精准的错误提示
     let credentials: CredentialInput[]
     try {
-      credentials = parseImportEntries(JSON.parse(jsonInput)).map(normalizeImportEntry)
+      credentials = parseImportInput(jsonInput).map(normalizeImportEntry)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -686,7 +717,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     if (!jsonInput.trim()) return { previewCredentials: [] as CredentialInput[], parseError: '' }
     try {
       return {
-        previewCredentials: parseImportEntries(JSON.parse(jsonInput)).map(normalizeImportEntry),
+        previewCredentials: parseImportInput(jsonInput).map(normalizeImportEntry),
         parseError: '',
       }
     } catch (error) {

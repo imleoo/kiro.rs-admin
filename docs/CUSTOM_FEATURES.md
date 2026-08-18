@@ -140,15 +140,20 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
   导入时自动归一化 `external_idp` 字段，从 JWT 补全邮箱/scopes/issuer/token endpoint。
 - 批量导入与 Account Manager 导入入口已合并进同一个对话框，支持导入时统一配置代理和 RPM；
   支持导出为 Account Manager 嵌套格式或通用 JSON。
-- 支持纯文本「每行一个 `ksk_` API Key」粘贴批量导入（JSON 解析失败且非 JSON 时的回退路径）。
-- **已知缺口**（2026-08-18 核实，本条曾错误记录为"已实现"，现更正）：API Key 凭据的
-  区域自动探测（`detect_api_key_region`/`api_key_region_candidates`/
-  `probe_api_key_usage_limits_one_region`）在本仓库**未实现**——这些函数只存在于
-  `upstream-admin` 未合并的提交 `73a1987`（"完善 API Key 模式的导入导出与区域自动探测"）
-  里。同理，`credential_to_export_account`（`src/admin/service.rs:452`）开头
-  `cred.refresh_token...?` 会在缺 `refreshToken` 时直接跳过该凭据导出，纯 API Key
-  凭据（无 `refreshToken`）目前**不会**被导出，与本条曾经的描述相反。若要补齐，
-  需评估合并 `upstream-admin` 的 `73a1987`。
+- 支持纯文本「每行一个 `ksk_` API Key」粘贴批量导入（JSON 解析失败且非 JSON 时的回退路径，
+  `parseImportInput`/`parsePlainTextApiKeys`）。
+- API Key 凭据支持区域自动探测（`detect_api_key_region`，`token_manager.rs` 里
+  `api_key_region_candidates` / `probe_api_key_usage_limits_one_region`，依次探测
+  `us-east-1`/`eu-central-1` 的 `getUsageLimits`，首个 200 即命中），添加/单条导入/
+  批量导入/粘贴导入均在 `add_credential_inner` 里统一覆盖（仅当未显式指定任何区域时
+  触发，探测失败按 401/402/403 判定为致命错误并拒绝添加，其余状态回退默认区域）；
+  导出支持 API Key（`ExportedCredentials.kiro_api_key` + `authMethod=api_key`，
+  不再因缺 `refreshToken` 被跳过）。
+- 2026-08-18 更正记录：以上区域自动探测 + 导出两点此前曾被错误记录为"已实现"，实测
+  代码中当时并不存在（只存在于 `upstream-admin` 未合并的提交 `73a1987`）；本次已按
+  该提交手工移植落地（`src/admin/service.rs`/`types.rs`、`src/kiro/token_manager.rs`、
+  `admin-ui/src/components/batch-import-dialog.tsx` 的纯文本回退），未采用其
+  `kam-import-dialog.tsx` 改动（该文件在本仓库已删除，功能并入 `batch-import-dialog.tsx`）。
 - 关键文件：`src/admin/service.rs`（`credential_to_export_account` 等）、
   `src/admin/types.rs`、`src/kiro/token_manager.rs`、
   `admin-ui/src/components/batch-import-dialog.tsx`（已删除的旧
