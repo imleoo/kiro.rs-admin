@@ -50,6 +50,17 @@ upstream 那套变成了完全未被引用、编译器也不会警告的**孤儿
 且**合并后要检查一遍新增文件是否都被正确 `mod` 声明引用**（`cargo build` 对孤儿文件完全
 沉默，不会报任何警告，必须手动核对，参考本次合并 commit `2480c14`）。
 
+**2026-08-18 复现一次**：合并 upstream-kiro v0.7.6（PR #64，修复 GPT-5.6 effort 与
+OpenAI 会话缓存）时，`git merge` 对这两个文件报了 `modify/delete` 冲突（本仓库已删除，
+upstream 又改了），这次冲突标记本身就提示了问题，`git rm` 二者即可，未再变成静默孤儿文件。
+但该 PR 里的实际功能改动（`resolve_session_metadata`：从 OpenAI 请求体 `prompt_cache_key`
+或 `x-session-affinity`/`x-client-request-id`/`session_id` 请求头推导会话 UUID，写入 Kiro
+`metadata.user_id` 提升上游 prompt cache 命中率）**必须手工移植**到
+`src/openai/{types,handlers}.rs`——已在本次合并中完成：`ChatCompletionRequest`/
+`ResponsesRequest` 新增 `prompt_cache_key` 字段，`chat_to_anthropic` 新增 `metadata`
+参数（原先硬编码 `None`，即本仓库 OpenAI 兼容层此前从未支持会话亲和/缓存命中优化），
+`post_chat_completions`/`post_responses` 新增 `resolve_session_metadata` 调用。
+
 ### 模型 ID 的 thinking 后缀规范化（合并时曾静默丢失）
 
 `map_model`（`src/anthropic/converter.rs`）合并 upstream-kiro 时从"字符串包含匹配"改写为
@@ -130,10 +141,14 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
 - 批量导入与 Account Manager 导入入口已合并进同一个对话框，支持导入时统一配置代理和 RPM；
   支持导出为 Account Manager 嵌套格式或通用 JSON。
 - 支持纯文本「每行一个 `ksk_` API Key」粘贴批量导入（JSON 解析失败且非 JSON 时的回退路径）。
-- API Key 凭据支持区域自动探测（`detect_api_key_region`，`token_manager.rs`
-  里 `api_key_region_candidates` / `probe_api_key_usage_limits_one_region`），
-  添加/单条导入/批量导入/粘贴导入均覆盖；导出支持 API Key（`ExportedCredentials.kiro_api_key`
-  + `authMethod=api_key`，不再因缺 `refreshToken` 被跳过）。
+- **已知缺口**（2026-08-18 核实，本条曾错误记录为"已实现"，现更正）：API Key 凭据的
+  区域自动探测（`detect_api_key_region`/`api_key_region_candidates`/
+  `probe_api_key_usage_limits_one_region`）在本仓库**未实现**——这些函数只存在于
+  `upstream-admin` 未合并的提交 `73a1987`（"完善 API Key 模式的导入导出与区域自动探测"）
+  里。同理，`credential_to_export_account`（`src/admin/service.rs:452`）开头
+  `cred.refresh_token...?` 会在缺 `refreshToken` 时直接跳过该凭据导出，纯 API Key
+  凭据（无 `refreshToken`）目前**不会**被导出，与本条曾经的描述相反。若要补齐，
+  需评估合并 `upstream-admin` 的 `73a1987`。
 - 关键文件：`src/admin/service.rs`（`credential_to_export_account` 等）、
   `src/admin/types.rs`、`src/kiro/token_manager.rs`、
   `admin-ui/src/components/batch-import-dialog.tsx`（已删除的旧
@@ -190,6 +205,13 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
   （鉴权/账号风控/其他三类）。
 - 关键文件：`src/admin/trace_db.rs`、`src/admin/handlers.rs`（`clear_traces`/
   `trace_failure_stats`）、`admin-ui/src/components/trace-log-page.tsx`。
+- 2026-08-18 合并 upstream-kiro PR #66 起，`KiroProvider::call_mcp_with_retry`
+  （web_search 内部 MCP 调用，`src/kiro/provider.rs`）补齐了与 `call_api_with_retry`
+  同等粒度的逐 attempt `emit_attempt` 记录；此前混合工具调用（web_search + 其它 tool）
+  请求里的 MCP 子调用不出现在 trace 链路中。合并时保留了本仓库
+  `call_mcp_with_retry` 自身的代理池故障转移（`execute_mcp_request_with_proxy_failover`）
+  和可配置 `retry_mode`/`retry_policy`（`effective_retry_policy`），仅叠加 trace 埋点，
+  未采用 upstream 的固定重试次数公式（`(总凭据数 × 每凭据重试数).min(总上限)`）。
 
 ### 7. 凭据管理页增强
 
