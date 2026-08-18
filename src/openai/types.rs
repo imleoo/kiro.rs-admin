@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::anthropic::types::{
-    CacheControl, Message, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool,
+    CacheControl, Message, Metadata, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool,
 };
 
 pub const DEFAULT_OPENAI_COMPAT_MODEL: &str = "claude-sonnet-4.5";
@@ -25,6 +25,9 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
     pub reasoning: Option<Value>,
     pub stream_options: Option<StreamOptions>,
+    /// OpenAI 会话亲和标识，用于推导 Kiro `metadata.user_id` 的 session 段
+    /// （提升上游 prompt cache 命中率），与 `metadata` 字段（原样回传）无关。
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +99,8 @@ pub struct ResponsesRequest {
     pub max_tokens: Option<i32>,
     pub reasoning: Option<Value>,
     pub metadata: Option<Value>,
+    /// 同 [`ChatCompletionRequest::prompt_cache_key`]。
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -148,6 +153,7 @@ pub fn openai_model_to_kiro_model(model: &str) -> String {
 
 pub fn chat_to_anthropic(
     req: &ChatCompletionRequest,
+    metadata: Option<Metadata>,
 ) -> Result<ConvertedOpenAIRequest, OpenAIConversionError> {
     if req.messages.is_empty() {
         return Err(err("messages must contain at least one message"));
@@ -186,7 +192,7 @@ pub fn chat_to_anthropic(
             tool_choice: convert_tool_choice(req.tool_choice.as_ref()),
             thinking,
             output_config,
-            metadata: None,
+            metadata,
             force_web_search_loop,
         },
         openai_messages: req.messages.clone(),
@@ -232,6 +238,7 @@ pub fn responses_to_chat_request(
         reasoning_effort: None,
         reasoning: req.reasoning.clone(),
         stream_options: None,
+        prompt_cache_key: req.prompt_cache_key.clone(),
     })
 }
 

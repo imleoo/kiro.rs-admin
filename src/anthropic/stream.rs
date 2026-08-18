@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::{Event, MeteringEvent};
+use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 
 /// thinking 块的 signature 占位字符串
 ///
@@ -1368,6 +1368,8 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 上游 metadataEvent.tokenUsage 的精确最终快照。
+    pub provider_token_usage: Option<TokenUsage>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -1432,13 +1434,30 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
-    /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
+    /// 解析 Anthropic 口径的 `(uncached_input, cache_write, cache_read)`。
     ///
-    /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
+    /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
+    /// contextUsage/请求估算总量与本地 CacheMeter 比例回退。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
+        if let Some(usage) = self.provider_token_usage {
+            let usage = usage.sanitized();
+            return (
+                usage.uncached_input_tokens,
+                usage.cache_write_input_tokens,
+                usage.cache_read_input_tokens,
+            );
+        }
+
         let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
         self.cache_usage.split_against_total(total_real)
+    }
+
+    /// 精确 provider 输出 token 优先，否则返回流内容的本地估算。
+    pub fn resolved_output_tokens(&self) -> i32 {
+        self.provider_token_usage
+            .map(|usage| usage.sanitized().output_tokens)
+            .unwrap_or(self.output_tokens)
+            .max(0)
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -1461,6 +1480,7 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            provider_token_usage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -1555,6 +1575,22 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::Metadata(metadata) => {
+                if let Some(usage) = metadata.token_usage {
+                    let usage = usage.sanitized();
+                    tracing::debug!(
+                        uncached_input_tokens = usage.uncached_input_tokens,
+                        cache_write_input_tokens = usage.cache_write_input_tokens,
+                        cache_read_input_tokens = usage.cache_read_input_tokens,
+                        output_tokens = usage.output_tokens,
+                        "收到 metadataEvent.tokenUsage 精确用量"
+                    );
+                    // tokenUsage 是最终快照；同一 provider 流内重复出现时取最后一份，
+                    // 不能累加，否则会重复计费。
+                    self.provider_token_usage = Some(usage);
+                }
+                Vec::new()
+            }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
@@ -2509,13 +2545,14 @@ impl StreamContext {
             }
         }
 
-        // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
+        // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let final_output_tokens = self.resolved_output_tokens();
 
         // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
-            self.output_tokens,
+            final_output_tokens,
             cache_creation,
             cache_read,
             self.metering.as_ref(),
@@ -2647,7 +2684,7 @@ impl BufferedStreamContext {
         let (input, creation, read) = self.inner.resolved_usage();
         (
             input,
-            self.inner.output_tokens,
+            self.inner.resolved_output_tokens(),
             creation,
             read,
             self.inner.credits,
@@ -5192,9 +5229,7 @@ mod tests {
     #[test]
     fn test_generate_final_events_carries_credit_fields_when_metering_present() {
         let mut manager = SseStateManager::new();
-        let metering = parse_metering(
-            r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#,
-        );
+        let metering = parse_metering(r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#);
         let events = manager.generate_final_events(10, 5, 0, 0, Some(&metering));
         let delta = events
             .iter()
@@ -5267,5 +5302,111 @@ mod tests {
         assert!(usage.get("credit_usage").is_none());
         assert!(usage.get("credit_unit").is_none());
         assert!(usage.get("credit_unit_plural").is_none());
+    }
+
+    #[test]
+    fn provider_usage_overrides_fallback_and_keeps_the_latest_snapshot() {
+        use crate::anthropic::cache_metering::CacheUsage;
+        use crate::kiro::model::events::MetadataEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.context_input_tokens = Some(80);
+        ctx.output_tokens = 99;
+        ctx.cache_usage = CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(TokenUsage {
+                uncached_input_tokens: 3,
+                output_tokens: 11,
+                cache_read_input_tokens: 7,
+                cache_write_input_tokens: 4,
+            }),
+        }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        assert_eq!(ctx.resolved_usage(), (3, 4, 7));
+        assert_eq!(ctx.resolved_output_tokens(), 11);
+
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(TokenUsage {
+                uncached_input_tokens: -1,
+                output_tokens: 22,
+                cache_read_input_tokens: 23,
+                cache_write_input_tokens: 24,
+            }),
+        }));
+        assert_eq!(ctx.resolved_usage(), (0, 24, 23));
+        assert_eq!(ctx.resolved_output_tokens(), 22);
+    }
+
+    #[test]
+    fn stream_usage_falls_back_to_context_cache_split_and_local_output() {
+        use crate::anthropic::cache_metering::CacheUsage;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.context_input_tokens = Some(80);
+        ctx.output_tokens = 9;
+        ctx.cache_usage = CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+
+        assert_eq!(ctx.resolved_usage(), (40, 20, 20));
+        assert_eq!(ctx.resolved_output_tokens(), 9);
+    }
+
+    #[test]
+    fn buffered_stream_reports_the_same_provider_usage_in_events_and_final_usage() {
+        use crate::kiro::model::events::MetadataEvent;
+
+        let usage = TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 11,
+            cache_read_input_tokens: 7,
+            cache_write_input_tokens: 4,
+        };
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
+            token_usage: Some(usage),
+        }));
+        let events = ctx.finish_and_get_all_events();
+
+        assert_eq!(ctx.final_usage(), (3, 11, 4, 7, 0.0));
+        let start_usage = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap()
+            .data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], json!(3));
+        assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
+        assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
+        let delta_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap()
+            .data["usage"];
+        assert_eq!(delta_usage["output_tokens"], json!(11));
     }
 }

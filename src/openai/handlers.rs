@@ -4,7 +4,7 @@ use axum::{
     Json as JsonExtractor,
     body::{Body, to_bytes},
     extract::{Extension, Path, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::anthropic::{
     handlers::post_messages,
     middleware::{AppState, KeyContext},
+    types::Metadata,
 };
 
 use super::types::{
@@ -40,10 +41,38 @@ fn responses_store() -> &'static RwLock<HashMap<String, StoredResponse>> {
     RESPONSES_STORE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// 从 OpenAI 请求体的 `prompt_cache_key` 或会话亲和请求头中提取并规范化会话
+/// UUID，写入 Kiro `metadata.user_id`（`session_<uuid>` 形式，与
+/// `anthropic::converter::extract_session_id` 的宽松匹配兼容），提升上游
+/// prompt cache 命中率。取不到合法 UUID 时返回 `None`（退回按 Key 隔离）。
+fn resolve_session_metadata(prompt_cache_key: Option<&str>, headers: &HeaderMap) -> Option<Metadata> {
+    let candidates = [
+        prompt_cache_key,
+        headers
+            .get("x-session-affinity")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("x-client-request-id")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("session_id")
+            .and_then(|value| value.to_str().ok()),
+    ];
+
+    candidates.into_iter().flatten().find_map(|candidate| {
+        let raw_uuid = candidate.strip_prefix("session_").unwrap_or(candidate);
+        let uuid = uuid::Uuid::parse_str(raw_uuid).ok()?;
+        Some(Metadata {
+            user_id: Some(format!("session_{uuid}")),
+        })
+    })
+}
+
 /// POST /v1/chat/completions
 pub async fn post_chat_completions(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut req): JsonExtractor<ChatCompletionRequest>,
 ) -> Response {
     apply_model_mapping(&state, &mut req.model);
@@ -51,7 +80,8 @@ pub async fn post_chat_completions(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
-    let converted = match chat_to_anthropic(&req) {
+    let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
+    let converted = match chat_to_anthropic(&req, metadata) {
         Ok(converted) => converted,
         Err(e) => return conversion_error(e),
     };
@@ -76,11 +106,13 @@ pub async fn post_chat_completions(
 pub async fn post_responses(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut req): JsonExtractor<ResponsesRequest>,
 ) -> Response {
     if let Some(model) = req.model.as_mut() {
         apply_model_mapping(&state, model);
     }
+    let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
     let previous_messages = match load_previous_messages(req.previous_response_id.as_deref()) {
         Ok(messages) => messages,
         Err(resp) => return resp,
@@ -89,7 +121,7 @@ pub async fn post_responses(
         Ok(req) => req,
         Err(e) => return conversion_error(e),
     };
-    let converted = match chat_to_anthropic(&chat_req) {
+    let converted = match chat_to_anthropic(&chat_req, metadata) {
         Ok(converted) => converted,
         Err(e) => return conversion_error(e),
     };
@@ -1182,8 +1214,48 @@ mod tests {
     };
     use super::{
         AnthropicSseTranslator, ChatStreamTranslator, ResponsesStreamMeta,
-        ResponsesStreamTranslator, SseFrameParser,
+        ResponsesStreamTranslator, SseFrameParser, resolve_session_metadata,
     };
+
+    const UUID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn resolve_session_metadata_from_prompt_cache_key() {
+        let metadata = resolve_session_metadata(Some(UUID_A), &axum::http::HeaderMap::new());
+        assert_eq!(
+            metadata.and_then(|m| m.user_id).as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn resolve_session_metadata_accepts_session_prefixed_value() {
+        let key = format!("session_{UUID_A}");
+        let metadata = resolve_session_metadata(Some(&key), &axum::http::HeaderMap::new());
+        assert_eq!(
+            metadata.and_then(|m| m.user_id).as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn resolve_session_metadata_falls_back_to_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-client-request-id", UUID_A.parse().unwrap());
+        let metadata = resolve_session_metadata(None, &headers);
+        assert_eq!(
+            metadata.and_then(|m| m.user_id).as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn resolve_session_metadata_ignores_invalid_candidates() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-client-request-id", "not-a-uuid".parse().unwrap());
+        assert!(resolve_session_metadata(Some("also-invalid"), &headers).is_none());
+        assert!(resolve_session_metadata(None, &axum::http::HeaderMap::new()).is_none());
+    }
 
     /// 把一段 Anthropic SSE 原文喂给 ChatStreamTranslator，收集其产出的
     /// `data: {...}` 行并解析成 JSON 序列（chat completions 流不带 `event:` 行）。
@@ -1297,7 +1369,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = chat_to_anthropic(&req).unwrap();
+        let converted = chat_to_anthropic(&req, None).unwrap();
         assert_eq!(converted.anthropic.model, "claude-sonnet-4.5");
         assert_eq!(converted.anthropic.messages.len(), 4);
         assert_eq!(converted.anthropic.system.unwrap()[0].text, "be brief");
@@ -1318,7 +1390,7 @@ mod tests {
                 "tools": [{"type": typ}]
             }))
             .unwrap();
-            let converted = chat_to_anthropic(&req).unwrap();
+            let converted = chat_to_anthropic(&req, None).unwrap();
             let tools = converted
                 .anthropic
                 .tools
@@ -1347,7 +1419,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let converted = chat_to_anthropic(&req).unwrap();
+        let converted = chat_to_anthropic(&req, None).unwrap();
         let tools = converted.anthropic.tools.unwrap();
         assert_eq!(tools.len(), 2);
         assert!(tools.iter().any(|t| t.name == "web_search"
@@ -1376,7 +1448,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = chat_to_anthropic(&req).unwrap();
+        let converted = chat_to_anthropic(&req, None).unwrap();
         let msgs = &converted.anthropic.messages;
         // user / assistant(2×tool_use) / user(2×tool_result 合并) / user(总结)
         assert_eq!(msgs.len(), 4);
@@ -1433,13 +1505,13 @@ mod tests {
 
         // none → 关推理：无 thinking、无 output_config
         let chat = responses_to_chat_request(&build("none"), Vec::new()).unwrap();
-        let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
+        let anthropic = chat_to_anthropic(&chat, None).unwrap().anthropic;
         assert!(anthropic.thinking.is_none(), "none 不应开启 thinking");
         assert!(anthropic.output_config.is_none(), "none 不应下发 output_config");
 
         // minimal → 归一化到 low（后端无 minimal 档）
         let chat = responses_to_chat_request(&build("minimal"), Vec::new()).unwrap();
-        let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
+        let anthropic = chat_to_anthropic(&chat, None).unwrap().anthropic;
         assert_eq!(anthropic.output_config.as_ref().unwrap().effort, "low");
         assert!(anthropic.thinking.is_some());
 
@@ -1451,7 +1523,7 @@ mod tests {
             ("xhigh", "xhigh"),
         ] {
             let chat = responses_to_chat_request(&build(input), Vec::new()).unwrap();
-            let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
+            let anthropic = chat_to_anthropic(&chat, None).unwrap().anthropic;
             assert_eq!(
                 anthropic.output_config.as_ref().unwrap().effort,
                 expected,
