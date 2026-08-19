@@ -413,7 +413,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
-fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
+pub(crate) fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
     matches!(
         model_id.to_ascii_lowercase().as_str(),
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::anthropic::converter::model_uses_gpt_reasoning_effort;
 use crate::anthropic::types::{
     CacheControl, Message, Metadata, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool,
 };
@@ -139,6 +140,13 @@ pub fn openai_model_to_kiro_model(model: &str) -> String {
     }
 
     let lower = trimmed.to_ascii_lowercase();
+    // Kiro 自家的 gpt-5.6-sol/terra/luna 原生模型族命名恰好也以 "gpt-" 开头，
+    // 必须排除在下面的"看起来是真·OpenAI 模型名"判定之外，否则会被错误地
+    // 强制改写为 DEFAULT_OPENAI_COMPAT_MODEL，导致这三个模型在 OpenAI 兼容层
+    // 下永远打不到自己、而是打到账号未必有权限的 Claude 模型上。
+    if model_uses_gpt_reasoning_effort(&lower) {
+        return trimmed.to_string();
+    }
     let looks_openai_native = lower.starts_with("gpt-")
         || lower.starts_with("o1")
         || lower.starts_with("o3")

@@ -1376,6 +1376,24 @@ mod tests {
         assert_eq!(converted.anthropic.tools.unwrap()[0].name, "get_weather");
     }
 
+    /// Kiro 原生的 gpt-5.6-sol/terra/luna 模型族命名也以 "gpt-" 开头，
+    /// 不能被 `openai_model_to_kiro_model` 的"看起来像真·OpenAI 模型名"判定
+    /// 误伤改写为 DEFAULT_OPENAI_COMPAT_MODEL，否则这三个模型在 OpenAI 兼容层
+    /// （/v1/chat/completions、/v1/responses）下永远打不到自己。
+    #[test]
+    fn chat_request_keeps_kiro_native_gpt_5_6_family_unmapped() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let req: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+
+            let converted = chat_to_anthropic(&req, None).unwrap();
+            assert_eq!(converted.anthropic.model, model);
+        }
+    }
+
     /// OpenAI/Codex 的内置 web search 工具（type=web_search / web_search_preview）
     /// 必须转成 Anthropic 原生格式（name=web_search, type 以 web_search_ 开头），
     /// 否则会在 convert_openai_tools 的 `!= "function"` 分支被丢弃，联网搜索彻底失效。
