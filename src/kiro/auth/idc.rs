@@ -59,7 +59,7 @@ pub async fn register_client(
     let client = build_client(proxy, 30, config.tls_backend)?;
 
     let body = RegisterClientRequest {
-        client_name: "kiro-rs".to_string(),
+        client_name: format!("KiroIDE-{}", config.kiro_version),
         client_type: "public".to_string(),
         scopes: KIRO_SCOPES.iter().map(|s| s.to_string()).collect(),
         grant_types: vec![
