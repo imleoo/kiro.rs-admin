@@ -286,6 +286,29 @@ fable5 独立确认的其余关键结论：抓包协议依据可信（结构与 
 token 计量是一处既有结构性缺口（图片同样如此，非本次引入），与"远程计数 API 不感知 CLI 剥离"
 一起归为本次改动之外的独立技术债。
 
+### 13. 真实上游联调（2026-08-23，测试服务器 172.104.94.251）
+
+提交推送到 `origin master`（commit `4d72b96`）后，按本仓库 `docs/DEPLOYMENT.md` 的既有流程部署到
+测试服务器（`git pull` → `docker compose -f docker-compose.prod.yml build && up -d`），用真实
+Kiro 凭据、真实发票 PDF（本仓库抓包研究阶段用过的同一份，`dzfp_...20260731105238.pdf`，141.5KB）
+打了一次端到端请求：
+
+```
+POST http://127.0.0.1:8990/v1/messages
+model: claude-sonnet-4.5
+content: [{"type":"document","title":"invoice.pdf","source":{"type":"base64","media_type":"application/pdf",...}},
+          {"type":"text","text":"这份发票的开票日期、销售方名称、价税合计金额分别是多少？"}]
+```
+
+结果：`HTTP 200`，8.1 秒返回，模型正确答出**开票日期 2026年07月31日、销售方"北京极客鲲鹏科技有限公司"、
+价税合计 ¥5400.00**——与发票原文完全一致（这几个数字不在文本提示里，只可能来自模型真正解析了
+`documents` 字段里的 PDF 字节）。Kiro 上游返回的真实 `usage.input_tokens=6679`，证实文档内容确实
+被计入了上游 token 消耗，不是被吞掉后模型瞎编。测试用的请求/响应文件（含真实发票内容）已在验证后
+从服务器和本机删除，未落盘保留。
+
+至此文档验收清单的最后一项也已完成——不再是"协议按抓包结构拼装正确"这个理论层面的确认，是真实
+Kiro 后端账号上的端到端验证。
+
 ## 四、验收标准
 
 - [x] `cargo build && cargo test` 通过（719 个测试全绿，比改动前的 671 个净增 48 个）
@@ -299,6 +322,10 @@ token 计量是一处既有结构性缺口（图片同样如此，非本次引�
 - [x] 本地 `/count_tokens` 与内部缓存命中估算能正确识别 document block，不再把 PDF 算成 0~1 token
 - [x] tool_result 内嵌的 document block（如"读文件"工具返回 PDF）能正确提升到顶层 `documents`，
       不会被静默丢弃
-- [ ] 真实联调：用带 PDF 附件的 Anthropic 客户端（如 Claude Code）打一次本仓库代理，确认 Kiro
-      后端真的接受 `documents` 字段并返回了基于文档内容的回答（目前只做到"协议按抓包结构拼装
-      正确"，还没有对着真实上游账号跑通这最后一环）
+- [x] 真实联调：用带 PDF 附件的请求打测试服务器上的真实 Kiro 凭据，确认 Kiro 后端真的接受
+      `documents` 字段并返回了基于文档内容的正确回答（见"十三、真实上游联调"）
+
+## 五、完整变更历史（git）
+
+- commit `4d72b96`（2026-08-23）：`feat(document): 接入 PDF 文档附件支持`——本文档记录的全部实现
+  与 8 轮审查修复，已推送到 `origin/master` 并部署到测试服务器验证通过。
