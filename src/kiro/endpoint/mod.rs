@@ -25,6 +25,16 @@ pub use ide::IdeEndpoint;
 pub use runtime::RuntimeEndpoint;
 pub use runtime_cli::RuntimeCliEndpoint;
 
+/// 判断端点名是否属于 CLI 协议族（`cli`/`runtime_cli`，origin=`KIRO_CLI`）。
+///
+/// CLI 协议族的两个端点在发送前会把请求体里的 `documents`（PDF 等文档附件）整体剥离
+/// 替换成占位文本（见 `cli::set_origin_kiro_cli`，`runtime_cli` 复用同一函数）——
+/// 调用方（token/cache 计量）需要这个信息来对齐"真实会发送的内容"，不能按客户端原始
+/// 请求里的文档字节估算。
+pub fn is_cli_family_endpoint_name(name: &str) -> bool {
+    name == cli::CLI_ENDPOINT_NAME || name == runtime_cli::RUNTIME_CLI_ENDPOINT_NAME
+}
+
 /// Kiro 端点
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。

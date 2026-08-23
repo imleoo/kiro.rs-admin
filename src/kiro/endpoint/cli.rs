@@ -123,6 +123,11 @@ impl KiroEndpoint for CliEndpoint {
 /// 1. 所有 "AI_EDITOR" origin 替换为 "KIRO_CLI"
 /// 2. 移除 conversationState.agentContinuationId（Kiro CLI 不发送此字段）
 /// 3. 移除 history 中用户消息的 modelId（Kiro CLI 不在历史消息里发送此字段）
+/// 4. 移除 currentMessage.userInputMessage.documents（文档附件），并在 content 里补一句提示
+///
+/// 第 4 点：`documents` 字段的真实协议是抓包官方 Kiro IDE（origin=AI_EDITOR）验证的，真实
+/// Kiro CLI 本身至今不支持文档附件（见 kirodotdev/Kiro#6458），未验证过 CLI 协议端点是否认
+/// 这个字段——保守起见直接不发，避免不确定的字段导致上游 400，同时用文本提示替代静默丢弃。
 ///
 /// runtime_cli 端点（`runtime_cli.rs`）与 cli 端点的请求体加工完全一致，直接复用本函数。
 pub(crate) fn set_origin_kiro_cli(body: &str) -> String {
@@ -145,6 +150,28 @@ pub(crate) fn set_origin_kiro_cli(body: &str) -> String {
                     .and_then(|v| v.as_object_mut())
                 {
                     user_input.remove("modelId");
+                }
+            }
+        }
+
+        if let Some(current) = state
+            .get_mut("currentMessage")
+            .and_then(|v| v.get_mut("userInputMessage"))
+            .and_then(|v| v.as_object_mut())
+        {
+            let doc_count = current
+                .remove("documents")
+                .and_then(|v| v.as_array().map(|a| a.len()))
+                .unwrap_or(0);
+            if doc_count > 0 {
+                tracing::warn!(
+                    "CLI 协议端点不支持文档附件，已丢弃 {} 个文档（真实 Kiro CLI 本身也不支持）",
+                    doc_count
+                );
+                if let Some(serde_json::Value::String(content)) = current.get_mut("content") {
+                    content.push_str(
+                        "\n\n[注意：本消息附带的文档未发送——当前协议暂不支持文档附件]",
+                    );
                 }
             }
         }
@@ -177,5 +204,25 @@ mod tests {
     fn test_set_origin_kiro_cli_no_origin() {
         let body = r#"{"conversationState":{}}"#;
         assert_eq!(set_origin_kiro_cli(body), r#"{"conversationState":{}}"#);
+    }
+
+    #[test]
+    fn test_set_origin_kiro_cli_strips_documents() {
+        let body = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"content":"这个 pdf 里有什么","origin":"AI_EDITOR","documents":[{"name":"a","format":"pdf","source":{"bytes":"AAAA"}}]}}}}"#;
+        let result = set_origin_kiro_cli(body);
+        assert!(
+            !result.contains("\"documents\""),
+            "CLI 协议不应该带 documents 字段: {result}"
+        );
+        assert!(result.contains("当前协议暂不支持文档附件"));
+        assert!(result.contains("这个 pdf 里有什么"));
+    }
+
+    #[test]
+    fn test_set_origin_kiro_cli_no_documents_untouched() {
+        let body = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"content":"hi","origin":"AI_EDITOR"}}}}"#;
+        let result = set_origin_kiro_cli(body);
+        assert!(!result.contains("当前协议暂不支持文档附件"));
+        assert!(!result.contains("\"documents\""));
     }
 }

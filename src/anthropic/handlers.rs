@@ -783,7 +783,10 @@ pub async fn post_messages(
 
     let stage_serialize_ms = stage_serialize_start.elapsed();
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        "Kiro request body: {}",
+        super::converter::redact_binary_payloads_for_log(&request_body)
+    );
 
     // 在把 payload 移入延迟计量闭包之前，先取出后续仍需的标量字段。
     let is_stream = payload.stream;
@@ -806,17 +809,29 @@ pub async fn post_messages(
     let compute_metering = {
         let cache_meter = state.cache_meter.clone();
         let key_id = key_ctx.key_id;
-        // payload 移入闭包（此处之后不再需要 payload 本体，request_body 已序列化）
-        move || -> (i32, super::cache_metering::CacheUsage) {
-            let total_input_tokens = token::count_all_tokens(
+        // payload 移入闭包（此处之后不再需要 payload 本体，request_body 已序列化）。
+        // 参数 is_cli_transport：调用方在上游调用完成、已知最终成功端点后才求值这个
+        // 闭包，据此判断这次请求是否走了会剥离 documents 的 CLI 协议族端点（见
+        // kiro::endpoint::is_cli_family_endpoint_name），让 token/cache 估算对齐
+        // 真实发送的内容，而不是客户端原始请求里的文档字节。
+        move |is_cli_transport: bool| -> (i32, super::cache_metering::CacheUsage) {
+            let total_input_tokens = token::count_all_tokens_with_transport(
                 &payload.model,
                 payload.system.as_deref(),
                 &payload.messages,
                 payload.tools.as_deref(),
+                is_cli_transport,
             ) as i32;
             let cache_usage = cache_meter
                 .as_ref()
-                .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_id))
+                .map(|cache| {
+                    super::cache_metering::compute_cache_usage_with_transport(
+                        cache,
+                        &payload,
+                        key_id,
+                        is_cli_transport,
+                    )
+                })
                 .unwrap_or_default();
             (total_input_tokens, cache_usage)
         }
@@ -875,8 +890,9 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     // 延迟计量：在上游 call_api_stream 返回后才调用，避免把 O(会话长度) 的
-    // token 估算 + CacheMeter 查写坐在首字关键路径上。
-    compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
+    // token 估算 + CacheMeter 查写坐在首字关键路径上。参数是 is_cli_transport
+    // （见闭包定义处的说明）。
+    compute_metering: impl FnOnce(bool) -> (i32, super::cache_metering::CacheUsage),
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
@@ -892,8 +908,9 @@ async fn handle_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             // 上游整链失败：此时仍需 input_tokens 记一次 error 用量。计量在此惰性求值，
-            // 不影响首字（首字已失败）。
-            let (input_tokens, _) = compute_metering();
+            // 不影响首字（首字已失败）。没有任何端点成功，不知道最终会不会走 CLI 协议族，
+            // 保守按 IDE 协议假设（现状，不会比之前更差）。
+            let (input_tokens, _) = compute_metering(false);
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize(
@@ -906,12 +923,14 @@ async fn handle_stream_request(
             return map_provider_error(e);
         }
     };
+    let is_cli_transport =
+        crate::kiro::endpoint::is_cli_family_endpoint_name(call_result.endpoint_name);
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
     // 上游已返回（首字已拿到）：此刻再做计量，不阻塞 TTFT。
     let stage_metering_start = Instant::now();
-    let (input_tokens, cache_usage) = compute_metering();
+    let (input_tokens, cache_usage) = compute_metering(is_cli_transport);
     tracer.mark_stage("metering", stage_metering_start.elapsed());
 
     // 创建流处理上下文
@@ -1120,7 +1139,7 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     // 延迟计量：上游返回后才求值，不阻塞响应（见 handle_stream_request 同款说明）。
-    compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
+    compute_metering: impl FnOnce(bool) -> (i32, super::cache_metering::CacheUsage),
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
@@ -1138,7 +1157,8 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             // 上游整链失败：惰性求值计量记一次 error 用量（不影响响应，已失败）。
-            let (input_tokens, _) = compute_metering();
+            // 没有任何端点成功，保守按 IDE 协议假设（见 handle_stream_request 同款说明）。
+            let (input_tokens, _) = compute_metering(false);
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "error",
@@ -1152,8 +1172,10 @@ async fn handle_non_stream_request(
     };
 
     // 上游已返回：此刻求值计量，不阻塞响应返回。
+    let is_cli_transport =
+        crate::kiro::endpoint::is_cli_family_endpoint_name(call_result.endpoint_name);
     let stage_metering_start = Instant::now();
-    let (input_tokens, cache_usage) = compute_metering();
+    let (input_tokens, cache_usage) = compute_metering(is_cli_transport);
     tracer.mark_stage("metering", stage_metering_start.elapsed());
     let response = call_result.response;
     let credential_id = call_result.credential_id;
@@ -1740,7 +1762,10 @@ pub async fn post_messages_cc(
 
     let stage_serialize_ms = stage_serialize_start.elapsed();
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        "Kiro request body: {}",
+        super::converter::redact_binary_payloads_for_log(&request_body)
+    );
 
     // 在把 payload 移入延迟计量闭包之前，先取出后续仍需的标量字段。
     let is_stream = payload.stream;
@@ -1760,16 +1785,24 @@ pub async fn post_messages_cc(
     let compute_metering = {
         let cache_meter = state.cache_meter.clone();
         let key_id = key_ctx.key_id;
-        move || -> (i32, super::cache_metering::CacheUsage) {
-            let total_input_tokens = token::count_all_tokens(
+        move |is_cli_transport: bool| -> (i32, super::cache_metering::CacheUsage) {
+            let total_input_tokens = token::count_all_tokens_with_transport(
                 &payload.model,
                 payload.system.as_deref(),
                 &payload.messages,
                 payload.tools.as_deref(),
+                is_cli_transport,
             ) as i32;
             let cache_usage = cache_meter
                 .as_ref()
-                .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_id))
+                .map(|cache| {
+                    super::cache_metering::compute_cache_usage_with_transport(
+                        cache,
+                        &payload,
+                        key_id,
+                        is_cli_transport,
+                    )
+                })
                 .unwrap_or_default();
             (total_input_tokens, cache_usage)
         }
@@ -1834,7 +1867,7 @@ async fn handle_stream_request_buffered(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     // 延迟计量：上游返回后才求值，不阻塞首字（详见 handle_stream_request 说明）。
-    compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
+    compute_metering: impl FnOnce(bool) -> (i32, super::cache_metering::CacheUsage),
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1845,7 +1878,8 @@ async fn handle_stream_request_buffered(
     {
         Ok(resp) => resp,
         Err(e) => {
-            let (fallback_input_tokens, _) = compute_metering();
+            // 没有任何端点成功，保守按 IDE 协议假设（见 handle_stream_request 同款说明）。
+            let (fallback_input_tokens, _) = compute_metering(false);
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "error",
@@ -1857,12 +1891,14 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e);
         }
     };
+    let is_cli_transport =
+        crate::kiro::endpoint::is_cli_family_endpoint_name(call_result.endpoint_name);
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
     // 上游已返回：此刻求值计量，不阻塞首字。
     let stage_metering_start = Instant::now();
-    let (fallback_input_tokens, cache_usage) = compute_metering();
+    let (fallback_input_tokens, cache_usage) = compute_metering(is_cli_transport);
     tracer.mark_stage("metering", stage_metering_start.elapsed());
 
     // 创建缓冲流处理上下文

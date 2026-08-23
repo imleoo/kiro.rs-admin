@@ -282,6 +282,12 @@ pub struct ContentBlock {
     pub source: Option<ImageSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+    /// document block 的文件标题（Anthropic 官方字段，用作 Kiro `documents[].name`）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// document block 的附加说明（Anthropic 官方字段，供模型参考如何使用该文档）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 /// 图片数据源
@@ -289,7 +295,13 @@ pub struct ContentBlock {
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String,
+    /// 图片 block 恒为必填；document block 的合法 source 还可能是 `type=="url"` /
+    /// `type=="file"`（Files API `file_id`）等不带 `media_type`/`data` 的形态——这两个
+    /// 字段缺省为空串而不是让整个 `ContentBlock` 反序列化失败，好让 document 分支能走到
+    /// 明确的"暂不支持"占位提示，而不是在 `if let Ok(block) = ...` 那层被静默吞掉。
+    #[serde(default)]
     pub media_type: String,
+    #[serde(default)]
     pub data: String,
 }
 

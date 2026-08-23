@@ -319,8 +319,27 @@ struct Segment {
 /// `key_id` 是客户端 Key id，用于会话隔离：前缀哈希会混入一个隔离种子（优先取
 /// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
 /// 缓存互不命中——同一前缀只在同一会话内复用。
+// 目前两处生产调用点都已知道真实端点、改用 compute_cache_usage_with_transport 了，
+// 这个简化版本暂时只有测试在用——保留是为了给"不关心 CLI 剥离细节"的未来调用方一个
+// 更简单的入口，不是遗留死代码。
+#[allow(dead_code)]
 pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
-    let (segments, prompt_total_est) = extract_segments(req, key_id);
+    compute_cache_usage_with_transport(cache, req, key_id, false)
+}
+
+/// 与 [`compute_cache_usage`] 相同，多一个 `is_cli_transport` 参数：调用方如果已经知道
+/// 这次请求最终会不会走 CLI 协议端点（发送前会把 `documents` 整个剥离替换成占位文本，
+/// 见 `kiro::endpoint::cli::set_origin_kiro_cli`），传 `true` 能让缓存哈希/token 估算
+/// 对齐真实会发送的内容。只有"上游调用已经完成、已知最终成功端点"的场景才应该传
+/// `true`；其余场景（包括本文件内的全部测试）继续用 [`compute_cache_usage`]（等价于
+/// 传 `false`，按 IDE 协议假设）即可，不需要逐个改造调用点。
+pub fn compute_cache_usage_with_transport(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+    is_cli_transport: bool,
+) -> CacheUsage {
+    let (segments, prompt_total_est) = extract_segments(req, key_id, is_cli_transport);
     if segments.is_empty() {
         // 无断点：仍带出 prompt_total_est 以便调用方将来扩展，但 covered=0 → 全入 input。
         return CacheUsage {
@@ -385,7 +404,11 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 ///
 /// `key_id` 用于会话隔离：哈希以一个隔离种子起头（优先用 metadata session，否则
 /// key_id），种子不计入 token，只让不同会话的同前缀产生不同 hash → 互不命中。
-fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
+fn extract_segments(
+    req: &MessagesRequest,
+    key_id: u64,
+    is_cli_transport: bool,
+) -> (Vec<Segment>, u32) {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut cum_tokens: u32 = 0;
@@ -493,9 +516,23 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         commit(&hasher, cum_tokens, &mut segments, ttl);
     }
 
-    // 3. messages：除最后一条外，每条 message 边界切一个递增前缀段。
-    let last_idx = req.messages.len().saturating_sub(1);
-    for (idx, msg) in req.messages.iter().enumerate() {
+    // 3. messages：除"当前消息"外，每条 message 边界切一个递增前缀段。
+    //
+    // "当前消息"不是简单的物理最后一条：结尾若是 assistant prefill，converter.rs 会把它
+    // 整条丢弃（既不当 currentMessage 也不进 history，直接从会发给 Kiro 的内容里消失），
+    // 改成把往前找到的最后一条 user 消息当作 currentMessage（见
+    // token::effective_current_message_index，与 convert_request_with_mode 的 prefill
+    // 截断规则一致）。这里必须对齐同一条规则、并且**截断掉被丢弃的尾部**，否则
+    // `[user(PDF), assistant(prefill)]` 这种场景会有两个问题：物理最后一条（assistant）
+    // 从未被真正发送，却仍会被喂进哈希/当前段处理；而真正的当前消息（user/PDF）会因为
+    // 不是物理最后一条被错误提交成"可复用的历史前缀"。
+    let effective_current_idx = crate::token::effective_current_message_index(&req.messages);
+    let messages_to_process: &[super::types::Message] = match effective_current_idx {
+        Some(idx) => &req.messages[..=idx],
+        None => &[],
+    };
+    let last_idx = effective_current_idx.unwrap_or(0);
+    for (idx, msg) in messages_to_process.iter().enumerate() {
         // role 进哈希（区分 user/assistant 边界），但不计入 token。
         feed(&mut hasher, &msg.role, "", &mut cum_tokens);
         match &msg.content {
@@ -507,6 +544,10 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                 // 图片数据指纹（区分不同图）、token 用 Anthropic 口径估算（(w×h)/750）。
                 // 不反序列化整个 block、不 clone Value：省开销，且避免「某 block
                 // 反序列化失败被跳过」造成的前缀漂移。
+                // 与 converter.rs 对齐：MAX_DOCUMENTS_PER_MESSAGE 只在 currentMessage
+                // 里生效，第 6 个及以后的合法文档会被降级成占位文本
+                let is_current_message = Some(idx) == effective_current_idx;
+                let mut accepted_doc_count = 0u32;
                 for v in arr {
                     if v.get("type").and_then(|t| t.as_str()) == Some("image") {
                         // 图片：哈希喂 media_type + 数据（保证不同图 hash 不同、同图稳定），
@@ -519,6 +560,53 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                         let img_tokens =
                             crate::image_resize::estimate_image_tokens(media_type, data);
                         cum_tokens = cum_tokens.saturating_add(img_tokens);
+                    } else if v.get("type").and_then(|t| t.as_str()) == Some("document") {
+                        // 文档：哈希喂 title + context + source.type + media_type + 数据
+                        // （保证不同文档 hash 不同，修复此前 document block 统一哈希成
+                        // "block:document||" 导致的假缓存命中）。title/context 也必须进哈希：
+                        // 它们会分别变成上游请求里的 documents[].name 和拼进正文的
+                        // "[文档说明: ...]"，同一份 PDF 换个 title/context 就是不同的真实
+                        // 请求，不能被判定成缓存命中。
+                        let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                        let context = v.get("context").and_then(|t| t.as_str()).unwrap_or("");
+                        let (source_type, media_type, data) = document_source_parts(v);
+                        hasher.update(b"block:document|");
+                        hasher.update(title.as_bytes());
+                        hasher.update(b"|");
+                        hasher.update(context.as_bytes());
+                        hasher.update(b"|");
+                        hasher.update(source_type.as_bytes());
+                        hasher.update(b"|");
+                        hasher.update(media_type.as_bytes());
+                        hasher.update(b"|");
+                        hasher.update(data.as_bytes());
+                        // token：文本型走既有文本估算（converter.rs 无条件内联文本型
+                        // document，不受 currentMessage/数量上限影响）；二进制型只有在
+                        // "converter.rs 真的会把它当文档发送"时才按内容估算，否则（历史
+                        // 消息 / 不支持的类型 / 空数据 / 超限大小 / 超过数量上限 / CLI
+                        // 协议端点会整体剥离 documents）按实际会发的占位文本量级估算，
+                        // 避免用从未真正发送的数据去估算/累计 token。
+                        let mut doc_tokens = if source_type == "text" {
+                            estimate_tokens(data).max(0) as u32
+                        } else if !is_cli_transport
+                            && is_current_message
+                            && accepted_doc_count < crate::token::MAX_DOCUMENTS_PER_MESSAGE_LOCAL
+                            && crate::token::document_would_be_sent_as_real_content(
+                                source_type,
+                                media_type,
+                                data,
+                            )
+                        {
+                            accepted_doc_count += 1;
+                            crate::token::estimate_document_tokens(data) as u32
+                        } else {
+                            crate::token::PLACEHOLDER_DOCUMENT_TOKENS as u32
+                        };
+                        if !context.is_empty() {
+                            doc_tokens =
+                                doc_tokens.saturating_add(estimate_tokens(context).max(0) as u32);
+                        }
+                        cum_tokens = cum_tokens.saturating_add(doc_tokens);
                     } else {
                         feed(
                             &mut hasher,
@@ -689,6 +777,25 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
         .and_then(|x| x.as_str())
         .unwrap_or("");
     (media_type, data)
+}
+
+/// 从 document content block 的 JSON 值取 `(source.type, media_type, data)`。
+/// 三者缺省为空串，交由调用方兜底；`data` 对 base64 型是原始文件字节，对 text 型是纯文本。
+fn document_source_parts(v: &serde_json::Value) -> (&str, &str, &str) {
+    let src = v.get("source");
+    let source_type = src
+        .and_then(|s| s.get("type"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let media_type = src
+        .and_then(|s| s.get("media_type"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let data = src
+        .and_then(|s| s.get("data"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    (source_type, media_type, data)
 }
 
 #[cfg(test)]
@@ -864,6 +971,49 @@ mod tests {
         let u = compute_cache_usage(&cache, &req, 1);
         assert_eq!(u.cache_covered_est, 0);
         assert_eq!(u.split_against_total(123), (123, 0, 0));
+    }
+
+    #[test]
+    fn trailing_assistant_prefill_message_is_excluded_not_committed_as_history() {
+        // [user, assistant] 收尾——在真实 Anthropic 语义下是 assistant prefill 请求，
+        // converter.rs 会把结尾的 assistant 消息整条丢弃（既不当 currentMessage 也不进
+        // history）。cache_metering 必须对齐：这条 assistant 消息不应该被当成"当前消息"
+        // 处理，也不应该被提交成可复用的历史前缀段（因为它根本不会被真正发送）。
+        use super::super::types::{Message, MessagesRequest};
+        let cache = CacheMeter::new(None);
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "x".to_string(),
+            max_tokens: 8,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("Hello".to_string()),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(
+                        "this looks like a lot of prefill text that would inflate covered"
+                            .to_string(),
+                    ),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let u = compute_cache_usage(&cache, &req, 1);
+        // 唯一真正会被发送的消息（截断后的 user "Hello"）是当前消息，不应该有任何
+        // 已提交的历史段——跟单条 user 消息（compute_cache_usage_single_message_no_prefix）
+        // 的行为应该一致，因为 converter.rs 实际发送的内容就是同一件事
+        assert_eq!(
+            u.cache_covered_est, 0,
+            "assistant prefill 之后没有真正的历史前缀可提交"
+        );
     }
 
     /// 构造一个普通工具，input_schema 的顶层 key 按给定顺序插入。
@@ -1417,7 +1567,11 @@ mod tests {
     #[test]
     fn token_count_excludes_signature_noise() {
         use super::super::types::{Message, MessagesRequest};
-        // 两条消息：第一条是历史（切段），内容为已知纯文本；最后一条占位（不切段）。
+        // 三条消息：前两条是历史（切段），第一条内容为已知纯文本；最后一条 user 占位
+        // （不切段，代表"这一轮的新输入"）。故意不用 [user, assistant] 两条收尾——
+        // 那个形状在真实 Anthropic 语义下就是 assistant prefill 请求（converter.rs
+        // 会整条丢弃末尾 assistant，见 effective_current_message_index），不是这个
+        // 用例想测的"历史段签名噪声"场景。
         let history_text = "the quick brown fox jumps over the lazy dog";
         let req = MessagesRequest {
             force_web_search_loop: false,
@@ -1429,8 +1583,14 @@ mod tests {
                     content: serde_json::json!([{"type": "text", "text": history_text}]),
                 },
                 Message {
+                    // 空内容：不贡献 token，这样最深命中段仍然精确等于 history_text 的
+                    // estimate，不用把 "ok" 的 token 也加进期望值
                     role: "assistant".to_string(),
-                    content: serde_json::Value::String("ok".to_string()),
+                    content: serde_json::Value::String(String::new()),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("next".to_string()),
                 },
             ],
             stream: false,
@@ -1514,6 +1674,256 @@ mod tests {
             "含图历史应跨轮命中且 read({}) 含图片 token({})",
             u2.cache_read,
             img_tokens
+        );
+    }
+
+    #[test]
+    fn different_documents_in_same_position_do_not_falsely_hit_cache() {
+        use super::super::types::{Message, MessagesRequest};
+
+        // 内容不同即可，不需要是合法 PDF——只测哈希是否纳入了文档数据
+        let doc_a = "QQ==".repeat(200);
+        let doc_b = "Qg==".repeat(200);
+
+        let make = |doc_data: &str, trailing: &str| MessagesRequest {
+            force_web_search_loop: false,
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type":"document","source":{"type":"base64","media_type":"application/pdf","data": doc_data}},
+                        {"type":"text","text":"describe"}
+                    ]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("a doc"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(trailing),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        let _ = compute_cache_usage(&cache, &make(&doc_a, "q1"), 1);
+        // 同一位置换了不同文档内容，历史前缀已经变了，不应该被判成缓存命中
+        let u2 = compute_cache_usage(&cache, &make(&doc_b, "q2"), 1);
+        assert_eq!(
+            u2.cache_read, 0,
+            "文档内容变化后不应假命中缓存: read={}",
+            u2.cache_read
+        );
+    }
+
+    #[test]
+    fn changing_document_title_or_context_does_not_falsely_hit_cache() {
+        use super::super::types::{Message, MessagesRequest};
+
+        let doc = "QQ==".repeat(200);
+
+        let make = |title: Option<&str>, context: Option<&str>, trailing: &str| {
+            let mut block = serde_json::json!({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": doc}
+            });
+            if let Some(t) = title {
+                block["title"] = serde_json::json!(t);
+            }
+            if let Some(c) = context {
+                block["context"] = serde_json::json!(c);
+            }
+            MessagesRequest {
+                force_web_search_loop: false,
+                model: "m".to_string(),
+                max_tokens: 8,
+                messages: vec![
+                    Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!([block, {"type":"text","text":"describe"}]),
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!("a doc"),
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!(trailing),
+                    },
+                ],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+            }
+        };
+
+        // title 变化：同一份 PDF 字节，换了 title，是不同的真实上游请求（KiroDocument.name
+        // 会变），不该被判成缓存命中
+        let cache_title = CacheMeter::new(None);
+        let _ = compute_cache_usage(&cache_title, &make(Some("a.pdf"), None, "q1"), 1);
+        let u2 = compute_cache_usage(&cache_title, &make(Some("b.pdf"), None, "q2"), 1);
+        assert_eq!(u2.cache_read, 0, "title 变化后不应假命中缓存");
+
+        // context 变化：同理，会拼进实际发给模型的正文
+        let cache_context = CacheMeter::new(None);
+        let _ = compute_cache_usage(&cache_context, &make(None, Some("看第一页"), "q1"), 1);
+        let u2 = compute_cache_usage(&cache_context, &make(None, Some("看第二页"), "q2"), 1);
+        assert_eq!(u2.cache_read, 0, "context 变化后不应假命中缓存");
+    }
+
+    #[test]
+    fn same_document_in_history_still_hits_cache_but_only_counts_placeholder_tokens() {
+        use super::super::types::{Message, MessagesRequest};
+
+        // 这份文档在这个请求结构里恒定处于历史消息位置（不是最后一条），对齐
+        // converter.rs 的行为，缓存计量应该只按占位文本量级计 token，而不是整份文件
+        let doc = "QQ==".repeat(200);
+        let doc_tokens = crate::token::estimate_document_tokens(&doc) as i32;
+        assert!(doc_tokens > 100);
+
+        let make = |trailing: &str| MessagesRequest {
+            force_web_search_loop: false,
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type":"document","source":{"type":"base64","media_type":"application/pdf","data": doc}},
+                        {"type":"text","text":"describe"}
+                    ]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("a doc"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(trailing),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        let u1 = compute_cache_usage(&cache, &make("q1"), 1);
+        assert_eq!(u1.cache_read, 0);
+
+        let u2 = compute_cache_usage(&cache, &make("q2"), 1);
+        assert!(
+            u2.cache_read > 0,
+            "同一份历史前缀（含文档）跨轮应该命中缓存: read={}",
+            u2.cache_read
+        );
+        assert!(
+            (u2.cache_read as i32) < doc_tokens,
+            "历史消息里的文档不应该按整份文件估算 token: read={}, doc_tokens={}",
+            u2.cache_read,
+            doc_tokens
+        );
+    }
+
+    #[test]
+    fn current_message_document_counts_full_estimate_in_cache_metering() {
+        use super::super::types::{Message, MessagesRequest};
+
+        // 文档就在当前消息（最后一条）里，缓存计量应该按真实内容估算 token，
+        // 而不是退化成占位文本量级
+        let doc = "QQ==".repeat(2000);
+        let doc_tokens = crate::token::estimate_document_tokens(&doc) as i32;
+        assert!(doc_tokens > 100);
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type":"document","source":{"type":"base64","media_type":"application/pdf","data": doc}}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        let u1 = compute_cache_usage(&cache, &req, 1);
+        assert!(
+            u1.prompt_total_est >= doc_tokens,
+            "当前消息里的文档应该按真实内容估算 token: prompt_total_est={}, doc_tokens={}",
+            u1.prompt_total_est,
+            doc_tokens
+        );
+
+        // 同一个请求，如果已知这次会走 CLI 协议端点（documents 会被整体剥离），
+        // 缓存计量不该再按真实内容估算
+        let cache_cli = CacheMeter::new(None);
+        let u_cli = compute_cache_usage_with_transport(&cache_cli, &req, 1, true);
+        assert!(
+            u_cli.prompt_total_est < doc_tokens,
+            "CLI 协议下文档已被剥离，估算不应该按真实内容算: prompt_total_est={}, doc_tokens={}",
+            u_cli.prompt_total_est,
+            doc_tokens
+        );
+    }
+
+    #[test]
+    fn spoofed_url_source_with_pdf_media_type_does_not_count_as_real_document_in_cache_metering() {
+        use super::super::types::{Message, MessagesRequest};
+
+        // source.type=="url" 但把 media_type 伪造成 application/pdf——converter.rs
+        // 只接受 base64 型的文档，缓存计量也不该被伪造的 media_type 骗过去
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type":"document","source":{"type":"url","media_type":"application/pdf","url":"https://example.com/a.pdf"}}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        let u1 = compute_cache_usage(&cache, &req, 1);
+        assert!(
+            u1.prompt_total_est < 1000,
+            "伪造 media_type 的 url 型 document 不应该被按真实 PDF 估算: prompt_total_est={}",
+            u1.prompt_total_est
         );
     }
 

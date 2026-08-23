@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroDocument, KiroImage, Message, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
@@ -805,7 +806,8 @@ pub fn convert_request_with_mode(
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, documents, tool_results) =
+        process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
@@ -877,6 +879,10 @@ pub fn convert_request_with_mode(
         user_input = user_input.with_images(images);
     }
 
+    if !documents.is_empty() {
+        user_input = user_input.with_documents(documents);
+    }
+
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
@@ -907,28 +913,74 @@ pub fn convert_request_with_mode(
     })
 }
 
+/// 把序列化后的 Kiro 请求体中所有 `"bytes"` 字段（`images[].source.bytes`、
+/// `documents[].source.bytes`）替换成长度占位符，供 DEBUG 级别日志使用。
+///
+/// PDF 等文档附件可达数十 MB，且内容可能是发票/合同等敏感信息，不能在 `tracing::debug!`
+/// 里整段明文落盘。`tracing::debug!` 的参数只在该 level 真正启用时才求值，所以这里的
+/// JSON 解析/重序列化开销不会影响正常（非 DEBUG）请求路径。
+pub fn redact_binary_payloads_for_log(body: &str) -> String {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    redact_bytes_fields(&mut json);
+    serde_json::to_string(&json).unwrap_or_else(|_| body.to_string())
+}
+
+fn redact_bytes_fields(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = value
+        && let Some(len) = map.get("bytes").and_then(|v| v.as_str()).map(str::len)
+    {
+        map.insert(
+            "bytes".to_string(),
+            serde_json::Value::String(format!("<redacted: {len} base64 chars>")),
+        );
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_bytes_fields(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                redact_bytes_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 确定聊天触发类型
 /// "AUTO" 模式可能会导致 400 Bad Request 错误
 fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
 
-/// 处理消息内容，提取文本、图片和工具结果
+/// 处理消息内容，提取文本、图片、文档和工具结果
 fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
-    process_message_content_dedup(content, None)
+) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
+    // keep_documents=true：仅 currentMessage（最后一条消息）调这个 wrapper
+    process_message_content_dedup(content, None, true)
 }
 
 /// Same as `process_message_content`, but when `dedup` is `Some` it deduplicates images by SHA256:
 /// the same image (identical base64) recurring across history is kept only on first sight and later replaced with placeholder text,
 /// avoiding the same screenshot being re-sent as base64 over multiple turns and burning tokens.
+///
+/// `keep_documents` controls whether `"document"` blocks are turned into real `KiroDocument` entries
+/// (`true`，仅当前消息) or dropped to a placeholder（`false`，历史消息）——实测官方 Kiro IDE 的
+/// `documents` 字段只出现在 currentMessage，历史消息从不携带，这里对齐该行为，同时避免同一份
+/// PDF 随对话轮次不断重复膨胀。
 fn process_message_content_dedup(
     content: &serde_json::Value,
     mut dedup: Option<&mut std::collections::HashSet<String>>,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    keep_documents: bool,
+) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
 
     match content {
@@ -952,12 +1004,41 @@ fn process_message_content_dedup(
                                 text_parts.push(placeholder);
                             }
                         }
+                        "document" => {
+                            // Anthropic 官方 document block 的可选 context 字段（给模型的补充
+                            // 说明，如"这是第 3 页最相关"）——无论走文本内联还是 KiroDocument
+                            // 路径都要保留，否则客户端指令会静默消失
+                            let context = block
+                                .context
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|c| !c.is_empty());
+                            if let Some(ctx) = context {
+                                text_parts.push(format!("[文档说明: {ctx}]"));
+                            }
+                            if let Some(source) = block.source {
+                                if source.source_type == "text" {
+                                    // 纯文本型 document block（无需 PDF 解析），直接拼进正文，
+                                    // 不占用 documents 配额，也不受 keep_documents 影响
+                                    text_parts.push(source.data);
+                                } else if let Some(placeholder) = extract_kiro_document(
+                                    source,
+                                    block.title.as_deref(),
+                                    keep_documents,
+                                    &mut documents,
+                                ) {
+                                    text_parts.push(placeholder);
+                                }
+                            }
+                        }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(
                                     &block.content,
                                     &mut dedup,
                                     &mut images,
+                                    keep_documents,
+                                    &mut documents,
                                 );
                                 let is_error = block.is_error.unwrap_or(false);
 
@@ -983,7 +1064,7 @@ fn process_message_content_dedup(
         _ => {}
     }
 
-    Ok((text_parts.join("\n"), images, tool_results))
+    Ok((text_parts.join("\n"), images, documents, tool_results))
 }
 
 /// 从 media_type 获取图片格式
@@ -1008,6 +1089,13 @@ fn extract_kiro_image(
     images: &mut Vec<KiroImage>,
 ) -> Option<String> {
     let format = get_image_format(&source.media_type)?;
+    // ImageSource.data 在 types.rs 里是 #[serde(default)]（为了让 document 分支能兼容
+    // url/file_id 等无 data 字段的合法 source 形态），畸形/残缺的 image block 因此也可能
+    // 携带空字符串 data 走到这里——必须显式拦截，否则会构造出 bytes="" 的 KiroImage 发给
+    // 上游，把本该"静默跳过这张图"的旧行为变成"整个请求可能因空图片数据被上游拒绝"。
+    if source.data.is_empty() {
+        return None;
+    }
     // History dedup: an already-seen image omits its base64 and returns placeholder text
     if let Some(seen) = dedup.as_deref_mut() {
         let mut hasher = Sha256::new();
@@ -1026,25 +1114,147 @@ fn extract_kiro_image(
     None
 }
 
+/// 从 media_type 获取文档格式（实测只确认了 "application/pdf"，其余官方 IDE 支持的
+/// csv/doc/docx/xls/xlsx/html/txt/markdown 未逐个抓包验证，故暂不放开）
+fn get_document_format(media_type: &str) -> Option<String> {
+    match media_type {
+        "application/pdf" => Some("pdf".to_string()),
+        _ => None,
+    }
+}
+
+/// base64 编码后的文档大小上限（约 33MB 原始文件，对齐 Anthropic 官方 PDF 支持的量级），
+/// 防止客户端传入异常巨大的文件拖垮请求体/占满内存
+const MAX_DOCUMENT_BASE64_LEN: usize = 45_000_000;
+
+/// 单条消息最多携带的文档数——对齐官方 Kiro IDE changelog 公布的上限（超出未经验证，
+/// 保守起见客户端侧先截断，避免把上游会不会拒绝的不确定请求发出去）
+const MAX_DOCUMENTS_PER_MESSAGE: usize = 5;
+
+/// 从文件名尾部剥离与 `format` 匹配的扩展名（大小写不敏感）。
+/// 实测官方 Kiro IDE 发送的 `documents[].name` 是去掉扩展名的原始文件名，这里对齐该行为。
+fn strip_matching_extension(name: &str, format: &str) -> String {
+    let suffix = format!(".{format}");
+    if name.len() >= suffix.len()
+        && name.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
+    {
+        name[..name.len() - suffix.len()].to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// 把 document block 转成 `KiroDocument`，逻辑与 `extract_kiro_image` 对称。
+///
+/// 取得 `source` 所有权而非借用：文档 base64 可达数十 MB，直接 move 进 `KiroDocument` 而不是
+/// 再 clone 一份，是这条路径上唯一有意义的一次数据搬运。
+///
+/// `keep_documents=false` 时一律不生成文档、只给占位文本（历史消息路径，见调用方注释）。
+/// 返回 `Some(placeholder)` 表示未写入 `documents`（历史消息/类型不支持/超限/超额），需要文本占位；
+/// 返回 `None` 表示已成功写入 `documents`。
+fn extract_kiro_document(
+    source: ImageSource,
+    title: Option<&str>,
+    keep_documents: bool,
+    documents: &mut Vec<KiroDocument>,
+) -> Option<String> {
+    if !keep_documents {
+        return Some("[文档已省略：仅在最新一轮消息中携带]".to_string());
+    }
+    // 类型/格式/大小的合法性判断放在数量上限之前：确保「第 6 个文档格式本身就不支持」
+    // 报出的是「格式不支持」而不是被数量上限误报成「超过 5 个」，掩盖真实原因。
+    if source.source_type != "base64" {
+        return Some(format!(
+            "[文档暂不支持: source.type={}，仅支持 base64 编码的 PDF]",
+            source.source_type
+        ));
+    }
+    let Some(format) = get_document_format(&source.media_type) else {
+        return Some(format!(
+            "[文档类型暂不支持: {}，当前仅支持 PDF]",
+            source.media_type
+        ));
+    };
+    if source.data.is_empty() {
+        return Some("[文档为空，已跳过]".to_string());
+    }
+    if source.data.len() > MAX_DOCUMENT_BASE64_LEN {
+        return Some(format!(
+            "[文档过大已跳过：{} 字节，上限 {} 字节]",
+            source.data.len(),
+            MAX_DOCUMENT_BASE64_LEN
+        ));
+    }
+    if documents.len() >= MAX_DOCUMENTS_PER_MESSAGE {
+        return Some(format!(
+            "[文档已跳过：单条消息最多支持 {MAX_DOCUMENTS_PER_MESSAGE} 个文档]"
+        ));
+    }
+    let name = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| strip_matching_extension(t, &format))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "document".to_string());
+    documents.push(KiroDocument::from_base64(name, format, source.data));
+    None
+}
+
 /// 提取工具结果内容
 ///
 /// Text elements remain as tool_result placeholder text; blocks with `type=="image"` are extracted into a `KiroImage`
 /// and lifted to the top-level `images` (Amazon Q's `ToolResult` has no image field, so images can only go through the top-level channel).
-/// If a tool_result has only images and no text, the placeholder text "[image attached]" is used.
+/// `type=="document"` blocks（比如一个"读文件"工具返回了 PDF 内容）走跟顶层 document block 完全一样的
+/// 处理链——同一个 `documents` vec，一起受 `keep_documents`/数量上限约束——同样通过 Amazon Q `ToolResult`
+/// 没有文档字段这唯一的顶层通道透传给 Kiro。
+/// If a tool_result has only images/documents and no text, a matching placeholder text is used.
 fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
+    keep_documents: bool,
+    documents: &mut Vec<KiroDocument>,
 ) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             let mut had_image = false;
+            let mut had_document = false;
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                // "document" 判断放在通用的"有没有 text 字段"分支之前：合法的 document
+                // block 本身不该有顶层 text 字段，但这是未做 schema 校验的原始 JSON，
+                // 一个畸形的 {"type":"document","text":"x",...} 如果先命中 text 分支，
+                // 会让内嵌的 PDF 无声消失（与 token.rs::count_all_tokens_local 同一类
+                // 顺序问题，第三轮已经在那边修过，这里补齐）。
+                let block_type = item.get("type").and_then(|v| v.as_str());
+                if block_type == Some("document")
+                    && let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
+                {
+                    had_document = true;
+                    if let Some(context) = block
+                        .context
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                    {
+                        parts.push(format!("[文档说明: {context}]"));
+                    }
+                    if let Some(source) = block.source {
+                        if source.source_type == "text" {
+                            parts.push(source.data);
+                        } else if let Some(placeholder) = extract_kiro_document(
+                            source,
+                            block.title.as_deref(),
+                            keep_documents,
+                            documents,
+                        ) {
+                            parts.push(placeholder);
+                        }
+                    }
+                } else if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
-                } else if item.get("type").and_then(|v| v.as_str()) == Some("image")
+                } else if block_type == Some("image")
                     && let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
                     && let Some(source) = block.source
                 {
@@ -1054,10 +1264,16 @@ fn extract_tool_result_content(
                     }
                 }
             }
-            if parts.is_empty() && had_image {
+            if !parts.is_empty() {
+                parts.join("\n")
+            } else if had_image && had_document {
+                "[image and document attached]".to_string()
+            } else if had_document {
+                "[document attached]".to_string()
+            } else if had_image {
                 "[image attached]".to_string()
             } else {
-                parts.join("\n")
+                String::new()
             }
         }
         Some(v) => v.to_string(),
@@ -1838,8 +2054,9 @@ fn merge_user_messages(
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) =
-            process_message_content_dedup(&msg.content, Some(dedup))?;
+        // keep_documents=false：历史消息不携带 documents，见 process_message_content_dedup 文档注释
+        let (text, images, _documents, tool_results) =
+            process_message_content_dedup(&msg.content, Some(dedup), false)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -3871,6 +4088,320 @@ mod tests {
     }
 
     #[test]
+    fn test_malformed_image_missing_data_is_silently_skipped_not_sent_empty() {
+        // ImageSource.media_type/data 因为要兼容 document 的 url/file_id source 加了
+        // #[serde(default)]，回归测试：畸形的 image block（缺 data 字段）反序列化会
+        // 成功但 data="" ——必须被显式跳过，不能构造出 bytes="" 的 KiroImage 发给上游
+        let req = single_user_request(serde_json::json!([
+            {"type": "text", "text": "看图"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png"}}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(
+            msg.images.is_empty(),
+            "缺 data 的畸形图片不应该生成空字节的 KiroImage"
+        );
+    }
+
+    // 极小的合法 base64 内容即可——转换逻辑只透传字节，不解析 PDF 结构
+    const TINY_DOC_B64: &str = "JVBERi0xLjcK";
+
+    fn single_user_request(content: serde_json::Value) -> MessagesRequest {
+        MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content,
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_document_block_becomes_kiro_document() {
+        let req = single_user_request(serde_json::json!([
+            {"type": "text", "text": "这个 pdf 里有什么"},
+            {"type": "document", "title": "invoice.pdf", "source": {
+                "type": "base64", "media_type": "application/pdf", "data": TINY_DOC_B64
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(msg.documents.len(), 1);
+        assert_eq!(msg.documents[0].format, "pdf");
+        // 实测官方 Kiro IDE 会去掉扩展名，这里对齐该行为
+        assert_eq!(msg.documents[0].name, "invoice");
+        assert_eq!(msg.documents[0].source.bytes, TINY_DOC_B64);
+        assert_eq!(msg.content, "这个 pdf 里有什么");
+    }
+
+    #[test]
+    fn test_document_block_without_title_falls_back_to_default_name() {
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "source": {
+                "type": "base64", "media_type": "application/pdf", "data": TINY_DOC_B64
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(msg.documents[0].name, "document");
+    }
+
+    #[test]
+    fn test_document_block_title_is_pure_extension_falls_back_to_default_name() {
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "title": ".pdf", "source": {
+                "type": "base64", "media_type": "application/pdf", "data": TINY_DOC_B64
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(
+            msg.documents[0].name, "document",
+            "标题剥掉扩展名后是空字符串，应该回退到默认名而不是保留裸扩展名"
+        );
+    }
+
+    #[test]
+    fn test_document_url_source_becomes_placeholder_not_silently_dropped() {
+        // Anthropic 官方合法的 document source 还有 url/file_id 等形态，本仓库暂不支持，
+        // 但必须给出明确占位提示，不能因为 ImageSource 缺 media_type/data 就整个反序列化
+        // 失败、被 `if let Ok(block) = ...` 静默吞掉
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "source": {
+                "type": "url", "url": "https://example.com/a.pdf"
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(msg.documents.is_empty());
+        assert!(
+            msg.content.contains("文档暂不支持"),
+            "URL 型 document source 应该有明确占位提示而不是静默消失: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn test_document_context_is_preserved_for_base64_document() {
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "title": "invoice.pdf", "context": "重点关注第 3 页金额", "source": {
+                "type": "base64", "media_type": "application/pdf", "data": TINY_DOC_B64
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(msg.documents.len(), 1);
+        assert!(
+            msg.content.contains("重点关注第 3 页金额"),
+            "document 的 context 说明不应该被丢弃: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn test_document_context_is_preserved_for_text_document() {
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "context": "这是会议纪要", "source": {
+                "type": "text", "media_type": "text/plain", "data": "纯文本内容"
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(msg.content.contains("这是会议纪要"));
+        assert!(msg.content.contains("纯文本内容"));
+    }
+
+    #[test]
+    fn test_document_block_unsupported_media_type_becomes_placeholder() {
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "source": {
+                "type": "base64", "media_type": "text/csv", "data": TINY_DOC_B64
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(
+            msg.documents.is_empty(),
+            "不支持的类型不应写入 documents"
+        );
+        assert!(
+            msg.content.contains("文档类型暂不支持"),
+            "应给出占位提示而不是静默丢弃: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn test_document_block_oversized_becomes_placeholder() {
+        // 构造一个超过 MAX_DOCUMENT_BASE64_LEN 的 base64 字符串（内容本身不需要合法）
+        let huge = "A".repeat(45_000_001);
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "source": {
+                "type": "base64", "media_type": "application/pdf", "data": huge
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(msg.documents.is_empty(), "超限文档不应写入 documents");
+        assert!(msg.content.contains("文档过大已跳过"));
+    }
+
+    #[test]
+    fn test_document_in_history_is_dropped_with_placeholder_not_resent() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "document", "title": "invoice.pdf", "source": {
+                            "type": "base64", "media_type": "application/pdf", "data": TINY_DOC_B64
+                        }}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("这是一份发票"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("金额是多少"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let state = &result.conversation_state;
+
+        // 当前消息（"金额是多少"）不应该携带任何文档
+        assert!(state.current_message.user_input_message.documents.is_empty());
+
+        // 历史消息里第一轮的文档字节不应该被重新编码进去（对齐官方 IDE 实测：documents 只活在
+        // currentMessage），只留占位文本提示曾经有过文档
+        let history_json = serde_json::to_string(&state.history).unwrap();
+        assert!(
+            !history_json.contains(TINY_DOC_B64),
+            "history 不应重复携带文档原始字节: {history_json}"
+        );
+        assert!(history_json.contains("文档已省略"));
+    }
+
+    #[test]
+    fn test_document_text_source_type_inlined_as_text() {
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "source": {
+                "type": "text", "media_type": "text/plain", "data": "纯文本文档内容"
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(
+            msg.documents.is_empty(),
+            "text 类型的 document 不应占用 documents 配额"
+        );
+        assert!(msg.content.contains("纯文本文档内容"));
+    }
+
+    #[test]
+    fn test_document_block_empty_data_becomes_placeholder() {
+        let req = single_user_request(serde_json::json!([
+            {"type": "document", "source": {
+                "type": "base64", "media_type": "application/pdf", "data": ""
+            }}
+        ]));
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(msg.documents.is_empty());
+        assert!(msg.content.contains("文档为空"));
+    }
+
+    #[test]
+    fn test_document_block_caps_at_five_per_message() {
+        let mut blocks: Vec<serde_json::Value> = (0..6)
+            .map(|i| {
+                serde_json::json!({"type": "document", "title": format!("doc-{i}.pdf"), "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": TINY_DOC_B64
+                }})
+            })
+            .collect();
+        blocks.push(serde_json::json!({"type": "text", "text": "六个文档"}));
+
+        let req = single_user_request(serde_json::Value::Array(blocks));
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(msg.documents.len(), 5, "单条消息最多保留 5 个文档");
+        assert!(
+            msg.content.contains("单条消息最多支持 5 个文档"),
+            "第 6 个文档应给出明确占位提示: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn test_redact_binary_payloads_for_log_strips_bytes_but_keeps_structure() {
+        let body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "hi",
+                        "documents": [{"name": "a", "format": "pdf", "source": {"bytes": "AAAABBBB"}}],
+                        "images": [{"format": "png", "source": {"bytes": "CCCCDDDD"}}]
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let redacted = redact_binary_payloads_for_log(&body);
+        assert!(!redacted.contains("AAAABBBB"));
+        assert!(!redacted.contains("CCCCDDDD"));
+        assert!(redacted.contains("redacted"));
+        assert!(redacted.contains("\"content\":\"hi\""));
+    }
+
+    #[test]
     fn test_tool_result_text_only_unchanged() {
         use super::super::types::Message as AnthropicMessage;
 
@@ -3919,6 +4450,120 @@ mod tests {
             tr[0].content[0].get("text").and_then(|v| v.as_str()),
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_document_lifts_to_top_level() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 一个"读文件"工具的 tool_result 里嵌了 PDF——Anthropic 官方合法用法，
+        // 之前会被 extract_tool_result_content 静默丢弃（没有 image/document 以外的分支）
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("summarize the report"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read_file", "input": {"path": "/report.pdf"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": [
+                            {"type": "document", "title": "report.pdf", "source": {
+                                "type": "base64", "media_type": "application/pdf", "data": TINY_DOC_B64
+                            }}
+                        ]}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(
+            msg.documents.len(),
+            1,
+            "document in tool_result should be lifted to top-level documents"
+        );
+        assert_eq!(msg.documents[0].format, "pdf");
+        assert_eq!(msg.documents[0].source.bytes, TINY_DOC_B64);
+
+        let tr = &msg.user_input_message_context.tool_results;
+        assert_eq!(tr.len(), 1);
+        assert_eq!(
+            tr[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some("[document attached]"),
+            "tool_result content should keep a placeholder and contain no base64"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_document_with_stray_text_field_not_bypassed() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 畸形输入：一个 document block 顶层多带了个 "text" 字段——不应该因为命中
+        // 通用的"有没有 text 字段"分支而让内嵌的 PDF 无声消失（与
+        // token.rs::count_all_tokens_local_document_block_not_bypassed_by_stray_text_field
+        // 同一类问题）
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read the report"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read_file", "input": {"path": "/report.pdf"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": [
+                            {"type": "document", "text": "", "source": {
+                                "type": "base64", "media_type": "application/pdf", "data": TINY_DOC_B64
+                            }}
+                        ]}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(
+            msg.documents.len(),
+            1,
+            "带杂散 text 字段的 document block 不应该绕过文档提取"
         );
     }
 }

@@ -95,10 +95,12 @@ impl ClientCache {
     }
 }
 
-/// API 调用结果，附带本次实际命中的上游凭据 ID（用于用量统计）
+/// API 调用结果，附带本次实际命中的上游凭据 ID（用于用量统计）和端点名
+/// （用于 token/cache 计量判断是否走了会剥离 documents 的 CLI 协议族端点）
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    pub endpoint_name: &'static str,
 }
 
 /// A successful MCP HTTP response whose trace attempt is finalized after body validation.
@@ -354,7 +356,10 @@ impl KiroProvider {
         let body = endpoint.transform_api_body(request_body, &rctx);
 
         tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-        tracing::debug!("实际发送请求体: {}", body);
+        tracing::debug!(
+            "实际发送请求体: {}",
+            crate::anthropic::converter::redact_binary_payloads_for_log(&body)
+        );
 
         let base = self
             .client_for_proxy(proxy.clone())?
@@ -1381,6 +1386,7 @@ impl KiroProvider {
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    endpoint_name,
                 });
             }
 
@@ -1643,6 +1649,7 @@ impl KiroProvider {
                             return Ok(KiroCallResult {
                                 response: fb_resp,
                                 credential_id: ctx.id,
+                                endpoint_name: fb_name,
                             });
                         }
                         Ok(fb_resp) => {

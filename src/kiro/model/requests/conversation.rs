@@ -102,6 +102,9 @@ pub struct UserInputMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// 文档列表（PDF 等，仅 currentMessage 携带，见 `KiroDocument` 文档注释）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -115,6 +118,7 @@ impl UserInputMessage {
             content: content.into(),
             model_id: model_id.into(),
             images: Vec::new(),
+            documents: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
         }
     }
@@ -128,6 +132,12 @@ impl UserInputMessage {
     /// 添加图片
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 添加文档
+    pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
+        self.documents = documents;
         self
     }
 
@@ -233,6 +243,43 @@ impl KiroImage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroImageSource {
     /// base64 编码的图片数据
+    pub bytes: String,
+}
+
+/// Kiro 文档（PDF 等）
+///
+/// 结构与 `KiroImage` 同构，多一个文件名字段。实测（抓包官方 Kiro IDE v1.0.337）确认：
+/// 只出现在 currentMessage 中，历史消息不携带，故不给 `UserMessage` 加对应字段。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroDocument {
+    /// 文件名（官方客户端实测会去掉扩展名，这里原样透传客户端提供的标题）
+    pub name: String,
+    /// 文档格式（当前仅支持 "pdf"）
+    pub format: String,
+    /// 文档数据源
+    pub source: KiroDocumentSource,
+}
+
+impl KiroDocument {
+    /// 从 base64 数据创建文档
+    pub fn from_base64(
+        name: impl Into<String>,
+        format: impl Into<String>,
+        data: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            format: format.into(),
+            source: KiroDocumentSource { bytes: data.into() },
+        }
+    }
+}
+
+/// Kiro 文档数据源
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroDocumentSource {
+    /// base64 编码的原始文件字节
     pub bytes: String,
 }
 

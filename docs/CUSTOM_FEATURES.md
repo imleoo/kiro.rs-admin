@@ -245,6 +245,31 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
   （历史修复见 commit `326a2c7`）。
 - 关键文件：`src/kiro/provider.rs`、`src/anthropic/handlers.rs`。
 
+### 10. PDF / 文档附件支持
+
+- 支持 Anthropic `document` content block（目前仅 `application/pdf`），转换为 Kiro 协议的
+  `conversationState.currentMessage.userInputMessage.documents` 字段，原始文件字节透传，
+  不做本地解析——协议字段是抓包官方 Kiro IDE v1.0.337 实测得来（详见
+  `docs/PDF_DOCUMENT_SUPPORT.md`），上游 kiro.rs / doitcan-oiu fork 均无此能力。
+- 只在 IDE 系端点（`ide`/`runtime`/`codewhisperer`/`amazonq`，origin=`AI_EDITOR`）发送；
+  CLI 系端点（`cli`/`runtime_cli`，origin=`KIRO_CLI`）会在 `set_origin_kiro_cli` 里剥离
+  `documents` 并回落成文本提示——真实 Kiro CLI 本身都不支持文档附件，未验证过该字段在
+  CLI 协议下是否被后端接受，保守起见不发。
+- `documents` 字段只在 currentMessage 出现，历史消息（`history[]`）不携带——同一份文档不会
+  随对话轮次不断重复膨胀；不支持的文档类型 / 超过 45MB base64 上限的文档会退化为文本占位提示，
+  不静默丢弃。tool_result 内嵌的 document block（如"读文件"工具返回 PDF）也会走同一条链路提升到
+  顶层 `documents`，不局限于用户消息里的顶层 document block。
+- token/cache 计量（`/count_tokens` 本地兜底、内部缓存命中模拟）会感知 CLI 端点会剥离
+  `documents` 这件事，按真实会发送的内容估算，不按客户端原始请求里的文档字节估算——但仅限本地
+  估算路径；配置了远程 count_tokens API 时该服务收到的是协议转换前的原始请求，天然感知不到任何
+  Kiro 协议层面的改写（不止文档剥离，工具名截断/图片压缩/模型映射等都一样），这是"接远程精确计数
+  服务"这个既有设计的固有特征。
+- 关键文件：`src/anthropic/converter.rs`（`extract_kiro_document`/`get_document_format`/
+  `extract_tool_result_content`）、`src/kiro/model/requests/conversation.rs`
+  （`KiroDocument`/`KiroDocumentSource`）、`src/kiro/endpoint/cli.rs`（`set_origin_kiro_cli`
+  剥离逻辑）、`src/token.rs`（`estimate_document_tokens` 的 PDF 页数扫描、CLI 剥离感知）、
+  `src/anthropic/cache_metering.rs`（缓存命中模拟对 document block 的哈希/token 处理）。
+
 ## 维护建议
 
 - 合并上游前先跑一遍本文档，确认待合并的上游 commit 是否触及上述任一功能域；
