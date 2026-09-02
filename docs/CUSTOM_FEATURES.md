@@ -15,6 +15,52 @@
 
 两个 remote 已配置在本地 `.git/config`，可用 `git fetch upstream-kiro` / `git fetch upstream-admin` 拉取最新。
 
+## 合并进度追踪
+
+### 2026-09-02：upstream-kiro 362d543..v0.8.0（45 commits）—— 仅合并 3 个独立 bug 修复，其余搁置
+
+`upstream-admin` 无新提交（最新仍是 2026-07-22 的 `e00bc27`，均已在此前记录/评估）。
+`upstream-kiro` 45 个新提交与本仓库 4 个自定义功能域产生真实架构重叠，规模过大不适合
+一次性全量合并，按用户决策分阶段处理，**本次只 cherry-pick 了 3 个真正独立、无重叠的
+后端 bug 修复**：
+
+- `f45bf05`（对应上游 `20161ae`）：`getUsageLimits`/`ListAvailableModels` 补发真实
+  `profileArn`，修复 Enterprise/IdC 账号 403。同步修了本仓库自有的 API Key 区域自动探测
+  （`probe_api_key_usage_limits_one_region`）调用点，跟随 `usage_limits_url` 签名变化。
+- `17c002b`（对应上游 `9140b11`）：`setUserPreference` 同样补发真实 `profileArn`。
+- `3bbdd0d`（对应上游 `e3866d9`）：空字符串 `proxy_url`/`proxyUrl` 视为未配置代理，回退到
+  全局代理，而不是启动失败。
+
+以下 4 类改动**故意搁置未合并**，需要单独开分支评估，合并时先读对应章节：
+
+1. **凭据选择"严格按优先级"重写**（`b0d3926`）：重写了 `acquire_context` 的 priority
+   模式选择逻辑（不再复用 `current_id` 快速路径，改为每次请求重新按 `(priority, id)` 排序
+   选择），同时改了多处 `min_by_key(|e| e.credentials.priority)` 为
+   `(priority, id)` 兜底破同分。这段代码与本仓库 RPM 限流、`least_conn` 负载均衡模式、
+   自愈（self-heal）逻辑深度纠缠（同一批函数），不是可以孤立摘取的小修复，需要人工对照
+   现有 `select_next_credential`/`try_self_heal` 实现评估行为差异后再决定是否采纳。
+2. **自定义模型管理新实现**（`8e54496` 等）：upstream 新增了一套运行时可热更新的模型
+   注册表 + Admin API（`GET/PUT /api/admin/config/custom-models`）+ 设置页「模型」分区，
+   与本仓库既有的"自定义模型映射"（见下文第 5 节，`src/model/custom_models.rs` +
+   `src/admin/model_mapping.rs` + `model-mappings-dialog.tsx`）是同一能力的重复实现。需要
+   评估是否合并为一套，而非并存两个模型别名管理入口。
+3. **代理治理增强**：`7b911c8`（全局代理独立用户名密码）、`8e54496` 中的"专属代理故障
+   自动切换"、`c86ce81`（proxy+model 设置加固），与本仓库代理池（负载策略/自动停用/
+   直连兜底）部分重叠，需要对照评估避免功能重复或行为冲突。
+4. **凭据元数据 schema + admin-ui 大改版**（约 19 个 commit：`8e8bae0`…`18d694c`，另加
+   `c4e2919`/`def8929`/`64af2af`/`482946f` 等控制台改版提交）：upstream 新增了一套面向
+   凭据转售场景的元数据体系（`type`/`saleStatus`/`salePrice`），以及配套的凭据卡片重设计、
+   Metadata 设置页、多主题选择器等。这套业务语义（卖号）是否适用本部署待确认；且改版会与
+   本仓库已深度定制的 `credential-card.tsx`（隐私模式）、`batch-import-dialog.tsx`（纯文本
+   批量导入）等产生大量冲突，需要专门评估。
+5. **`/v1/responses` 流式与 Codex 兼容性重写**（`de53acc`，单 commit 2776 行）：大幅重写了
+   `src/anthropic/responses.rs`/`handlers.rs`/`stream.rs`/`websearch_loop.rs`，改善流式增量
+   转换、WebSearch 保活、取消传播、中断后 usage/trace 结算。本仓库该能力落在
+   `src/openai/*`（见下文"OpenAI 兼容层"架构分歧），**不能直接拿文件**，需要把
+   upstream 这次修的具体 bug 逐条对照移植到 `src/openai/handlers.rs`。搁置原因是工作量大
+   （移植 + 验证成本高），不是内容不重要——如果用户反馈 `/v1/responses` 或 Codex CLI
+   连接不稳定，应优先翻这个 commit。
+
 ## 已知架构分歧（合并时需要人工决策，不能自动合并）
 
 ### 429 / 账号级风控冷却 vs 无退避多端点顺序重试
