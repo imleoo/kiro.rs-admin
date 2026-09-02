@@ -163,6 +163,28 @@ struct RequestTraceOptions {
     is_stream: bool,
 }
 
+#[cfg(test)]
+impl RequestTracer {
+    /// 测试专用构造器：跳过 `AppState`/`RequestTraceOptions`，直接指定 `store`/`model`
+    /// 建一个可用的 `RequestTracer`。供其它模块（如 `websearch_loop`）的测试复用，
+    /// 避免为了测 `Drop` 兜底之类的行为而把 `RequestTracer` 的私有字段整体开放出去。
+    pub(super) fn for_test(store: Option<SharedTraceStore>, model: &str) -> Self {
+        Self {
+            store,
+            trace_id: Uuid::new_v4().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 0,
+            key_source: TraceKeySource::ClientKey,
+            model: model.to_string(),
+            is_stream: false,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            stages: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+}
+
 impl RequestTracer {
     fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
@@ -982,7 +1004,7 @@ async fn handle_stream_request(
 const PING_INTERVAL_SECS: u64 = 25;
 
 /// 创建 ping 事件的 SSE 字符串
-fn create_ping_sse() -> Bytes {
+pub(super) fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
