@@ -1,7 +1,7 @@
 //! Admin API 类型定义
 
 use crate::admin::proxy_pool::ProxyHealth;
-use crate::model::config::RetryPolicy;
+use crate::model::config::{CustomModel, RetryPolicy};
 use serde::{Deserialize, Serialize};
 
 // ============ 凭据状态 ============
@@ -804,6 +804,22 @@ pub struct GlobalProxyResponse {
 pub struct SetGlobalProxyRequest {
     /// 代理 URL，null 表示清除全局代理
     pub proxy_url: Option<String>,
+}
+
+// ============ 自定义模型 ============
+
+/// 自定义模型列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModelsResponse {
+    pub custom_models: Vec<CustomModel>,
+}
+
+/// 整表替换自定义模型列表请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCustomModelsRequest {
+    pub custom_models: Vec<CustomModel>,
 }
 
 // ============ 在线更新配置 ============

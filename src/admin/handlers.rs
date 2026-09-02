@@ -22,9 +22,10 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
-        ModelTestRequest, ProxyCheckUrlRequest, SetAccountThrottleConfigRequest,
-        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
+        CreateClientKeyResponse, CredentialResponseTestRequest, CustomModelsResponse,
+        GlobalProxyResponse, ModelTestRequest, ProxyCheckUrlRequest,
+        SetAccountThrottleConfigRequest, SetCustomModelsRequest, SetDisabledRequest,
+        SetGlobalProxyRequest, SetLoadBalancingModeRequest,
         SetLogGovernanceConfigRequest, SetPriorityRequest, SetProxyBalancingModeRequest,
         SetRetryPolicyRequest, SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
@@ -767,6 +768,26 @@ pub async fn set_global_proxy(
 ) -> impl IntoResponse {
     match state.service.set_global_proxy(payload.proxy_url) {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/custom-models
+/// 获取当前自定义模型列表
+pub async fn get_custom_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(CustomModelsResponse {
+        custom_models: state.service.get_custom_models(),
+    })
+}
+
+/// PUT /api/admin/config/custom-models
+/// 整表替换自定义模型列表，校验通过后持久化并热生效
+pub async fn set_custom_models(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCustomModelsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_custom_models(payload.custom_models) {
+        Ok(_) => Json(SuccessResponse::new("自定义模型已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

@@ -648,6 +648,37 @@ export interface UpsertModelMappingRequest {
   target: string
 }
 
+// ============ 自定义模型（新增/覆盖后端模型定义，含完整元数据） ============
+//
+// 与上面的"模型映射"是两套不同的能力：模型映射只做请求时的名字转发（源名不出现
+// 在 /v1/models）；这里是注册一个完整的后端模型定义（会出现在 /v1/models 里，
+// 可覆盖内置模型的元数据）。
+
+export interface CustomModel {
+  /** 客户端请求时使用的模型名（别名），匹配大小写不敏感 */
+  id: string
+  /** 映射到的 Kiro 后端模型 ID（实际下发给上游） */
+  backendId: string
+  /** /v1/models 展示名，缺省用 id */
+  displayName?: string | null
+  /** 上下文窗口大小，缺省 200000 */
+  contextWindow?: number | null
+  /** 单次响应最大 token 数，缺省 64000 */
+  maxTokens?: number | null
+  /** 是否支持原生 reasoning，缺省 false */
+  supportsReasoning?: boolean | null
+  /** /v1/models 的 ownedBy 字段，缺省 "custom" */
+  ownedBy?: string | null
+}
+
+export interface CustomModelsResponse {
+  customModels: CustomModel[]
+}
+
+export interface SetCustomModelsRequest {
+  customModels: CustomModel[]
+}
+
 export interface CreateGroupRequest {
   name: string
   description?: string
