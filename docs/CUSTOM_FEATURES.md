@@ -61,6 +61,36 @@
    （移植 + 验证成本高），不是内容不重要——如果用户反馈 `/v1/responses` 或 Codex CLI
    连接不稳定，应优先翻这个 commit。
 
+### 2026-09-02 后续：分 5 个 Stage 逐一处理上述搁置项（Stage A-E，均已完成）
+
+上述 4 类搁置改动 + 条目 5 的 `de53acc`，按用户决策拆成 5 个独立分支，每个 Stage
+一个 feature commit + 一个 `merge: Stage X - ...` 合并提交并入 `master`，而非直接
+采纳 upstream 对应 commit（除非明确说明"采纳"，否则均为本仓库根据同一症状写的
+独立实现，架构与 upstream 不同）：
+
+- **Stage A**（`76ba4a6`，独立实现，未采纳 `b0d3926`）：只修复 priority 模式下
+  `current_id` 陈旧导致高优先级凭据恢复后无法立即回切的 bug，加 `(priority, id)`
+  兜底破同分；保留本仓库原有的 `discovery_rank`/RPM 限流/`least_conn` 设计不变。
+  条目 1 的"是否整体采纳 `acquire_context` 重写"仍未评估，本次只是修了一个独立 bug。
+- **Stage B**（`cb99817`，独立实现）：给本仓库既有的 `src/model/custom_models.rs`
+  自定义模型映射加上运行时热更新能力 + Admin API/UI（`custom-models-dialog.tsx`），
+  与既有 `model_mapping.rs`/`model-mappings-dialog.tsx` 互补而非取代，两套模型别名
+  管理入口**仍同时存在**，条目 2 里"是否合并为一套"尚未处理。
+- **Stage C**（`baa22a1`，独立实现）：给全局代理 Admin API 补上独立用户名/密码支持，
+  含不回显明文密码、成对校验、持久化顺序修正等安全加固；只覆盖条目 3 里"全局代理独立
+  账密"这一小项，"专属代理故障自动切换"等其余点未处理。
+- **Stage D**（`d000d80`）+ **Stage E**（本次）合起来完整覆盖了条目 5：Stage D 修了
+  流取消未结算用量/trace（`StreamSettlement`+Drop）、工具 JSON 错误事件顺序错误、
+  非流式 reasoning 被全局开关吞掉；Stage E 修了多轮 web_search agentic loop 的流式
+  保活（立即发 `message_start` + 25s ping，避免长耗时搜索被客户端判定连接已死）、
+  取消传播（`while_receiver_open`）、中断后 usage/trace 结算
+  （`WebSearchUsageSettlement`+Drop）。两个 Stage 均未整体移植 `de53acc`
+  （体量 2776 行、大部分是 upstream "伪流式改真流式"的架构迁移，与本仓库从起点就是
+  真流式的 `src/openai/*` 无关），只挑了确实存在的具体问题逐条对照修复，**条目 5
+  可视为已处理完毕**。
+- 条目 4（凭据元数据 schema + admin-ui 大改版）**未安排 Stage、仍完全搁置**：
+  业务语义（卖号场景）是否适用本部署尚未确认。
+
 ## 已知架构分歧（合并时需要人工决策，不能自动合并）
 
 ### 429 / 账号级风控冷却 vs 无退避多端点顺序重试
