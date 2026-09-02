@@ -796,14 +796,29 @@ pub struct AssignProxyRequest {
 pub struct GlobalProxyResponse {
     /// 当前全局代理 URL（null 表示未配置）
     pub proxy_url: Option<String>,
+    /// 认证用户名（null 表示未配置）
+    pub proxy_username: Option<String>,
+    /// 是否已配置认证密码——**不回显明文密码**，仅告知是否已设置
+    pub proxy_password_set: bool,
 }
 
 /// 设置全局代理请求
+///
+/// `proxy_url` 为 `None` 时清除整个全局代理（含 username/password，此时后两个字段
+/// 被忽略）。`proxy_url` 为 `Some` 时：`proxy_username`/`proxy_password` 采用与
+/// [`super::types::UpdateCredentialRequest`] 一致的部分更新语义——字段缺失（反序列化为
+/// `None`）表示不改动，空字符串表示清除，非空字符串表示设置为该值。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetGlobalProxyRequest {
-    /// 代理 URL，null 表示清除全局代理
+    /// 代理 URL（可含多个候选，逗号/空白/换行分隔），None 表示清除全局代理
     pub proxy_url: Option<String>,
+    /// 认证用户名：缺省=不改，空字符串=清除，非空=设置
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// 认证密码：缺省=不改，空字符串=清除，非空=设置
+    #[serde(default)]
+    pub proxy_password: Option<String>,
 }
 
 // ============ 自定义模型 ============

@@ -38,13 +38,14 @@ use super::types::{
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CompleteSocialLoginRequest,
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
     CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
-    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    GitHubRateLimitInfo, GlobalProxyResponse, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
     ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
     RetryPolicyResponse, SelfHealConfigResponse, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
-    SetRetryPolicyRequest, SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+    SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetSelfHealConfigRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
@@ -77,7 +78,7 @@ fn normalize_proxy_list(raw: &str) -> Result<Option<String>, AdminServiceError> 
     for candidate in &candidates {
         if !ProxyConfig::is_supported_entry(candidate) {
             return Err(AdminServiceError::InvalidCredential(format!(
-                "代理 URL 格式无效: {}。支持 http://、https://、socks5://、socks4://，多个代理可用逗号/空格/换行分隔，direct 表示直连候选",
+                "代理 URL 格式无效: {}。支持 http://、https://、socks5://、socks5h://、socks4://、socks4a://，多个代理可用逗号/空格/换行分隔，direct 表示直连候选",
                 candidate
             )));
         }
@@ -1728,24 +1729,89 @@ impl AdminService {
         }
     }
 
-    /// 获取全局代理 URL
-    pub fn get_global_proxy(&self) -> Option<String> {
-        self.token_manager.proxy().map(|p| p.url.clone())
+    /// 获取全局代理配置。**不回显明文密码**，只告知是否已设置。
+    pub fn get_global_proxy(&self) -> GlobalProxyResponse {
+        let proxy = self.token_manager.proxy();
+        GlobalProxyResponse {
+            proxy_url: proxy.as_ref().map(|p| p.url.clone()),
+            proxy_username: proxy.as_ref().and_then(|p| p.username.clone()),
+            proxy_password_set: proxy.as_ref().map(|p| p.password.is_some()).unwrap_or(false),
+        }
     }
 
-    /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
-    pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
-        let normalized = match url {
+    /// 设置或清除全局代理配置（URL + 可选认证账密）并持久化到配置文件。
+    ///
+    /// `proxy_url` 为 `None` 时清除整个全局代理，包括认证信息。`proxy_url` 为
+    /// `Some` 时，`proxy_username`/`proxy_password` 采用与凭据编辑一致的部分更新
+    /// 语义：字段缺失＝不改动（沿用当前已持久化的值），空字符串＝清除，非空＝设置。
+    ///
+    /// 持久化顺序：先写配置文件（失败则直接上抛，不留半更新状态），成功后才切换
+    /// 运行时代理，避免"进程内已生效、重启后又变回旧配置"的不一致。
+    pub fn set_global_proxy(
+        &self,
+        req: SetGlobalProxyRequest,
+    ) -> Result<GlobalProxyResponse, AdminServiceError> {
+        let normalized_url = match req.proxy_url {
             Some(raw) => normalize_proxy_list(&raw)?,
             None => None,
         };
-        let proxy = normalized.as_deref().map(ProxyConfig::new);
-        self.token_manager.set_global_proxy(proxy);
 
-        // 从磁盘加载最新 config 再写，避免覆盖其他字段的并发修改
-        let url_for_save = normalized;
-        self.update_config_file(move |c| c.proxy_url = url_for_save);
-        Ok(())
+        if normalized_url.is_none() {
+            self.token_manager
+                .update_config_file(|c| {
+                    c.proxy_url = None;
+                    c.proxy_username = None;
+                    c.proxy_password = None;
+                })
+                .map_err(|e| {
+                    AdminServiceError::InternalError(format!("保存全局代理配置失败: {}", e))
+                })?;
+            self.token_manager.set_global_proxy(None);
+            return Ok(self.get_global_proxy());
+        }
+
+        let current = self.token_manager.proxy();
+        let username = match req.proxy_username {
+            None => current.as_ref().and_then(|p| p.username.clone()),
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(v),
+        };
+        let password = match req.proxy_password {
+            None => current.as_ref().and_then(|p| p.password.clone()),
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(v),
+        };
+
+        // 代理认证必须成对出现：只给用户名没密码（或反过来）在实际发起请求时
+        // 无法构造合法的 Basic Auth，与其静默丢弃单独一侧，不如直接拒绝，让调用方
+        // 显式补齐或把两者都清空。
+        if username.is_some() != password.is_some() {
+            return Err(AdminServiceError::InvalidCredential(
+                "全局代理认证用户名和密码必须同时设置或同时清除".to_string(),
+            ));
+        }
+
+        let url_for_save = normalized_url.clone();
+        let username_for_save = username.clone();
+        let password_for_save = password.clone();
+        self.token_manager
+            .update_config_file(move |c| {
+                c.proxy_url = url_for_save;
+                c.proxy_username = username_for_save;
+                c.proxy_password = password_for_save;
+            })
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("保存全局代理配置失败: {}", e))
+            })?;
+
+        let url = normalized_url.expect("已在上面 is_none() 分支提前返回");
+        let mut proxy = ProxyConfig::new(&url);
+        if let (Some(u), Some(p)) = (&username, &password) {
+            proxy = proxy.with_auth(u.clone(), p.clone());
+        }
+        self.token_manager.set_global_proxy(Some(proxy));
+
+        Ok(self.get_global_proxy())
     }
 
     /// 获取当前自定义模型列表（保持配置文件中的原始顺序）
@@ -4061,6 +4127,122 @@ mod tests {
         let mut model = sample_custom_model("has-control");
         model.display_name = Some("bad\u{0007}name".to_string());
         assert!(validate_custom_models(vec![model]).is_err());
+    }
+
+    fn tmp_config_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("kiro_admin_service_test_{}.json", name));
+        p
+    }
+
+    fn build_service_with_config_path(path: &std::path::Path) -> AdminService {
+        let config = Config::load(path).unwrap();
+        config.save().unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap(),
+        );
+        AdminService::new(manager, Vec::new(), empty_proxy_pool())
+    }
+
+    #[tokio::test]
+    async fn set_global_proxy_persists_url_and_auth_then_clears_via_empty_url() {
+        let path = tmp_config_path("global_proxy_persist");
+        let service = build_service_with_config_path(&path);
+
+        // 首次设置：URL + 账密
+        let response = service
+            .set_global_proxy(SetGlobalProxyRequest {
+                proxy_url: Some("http://proxy.example.com:8080".to_string()),
+                proxy_username: Some("alice".to_string()),
+                proxy_password: Some("s3cr3t".to_string()),
+            })
+            .unwrap();
+        assert_eq!(response.proxy_url.as_deref(), Some("http://proxy.example.com:8080"));
+        assert_eq!(response.proxy_username.as_deref(), Some("alice"));
+        assert!(response.proxy_password_set);
+
+        let persisted = Config::load(&path).unwrap();
+        assert_eq!(persisted.proxy_url.as_deref(), Some("http://proxy.example.com:8080"));
+        assert_eq!(persisted.proxy_username.as_deref(), Some("alice"));
+        assert_eq!(persisted.proxy_password.as_deref(), Some("s3cr3t"));
+
+        // 只改 URL，不带 username/password 字段：应保留原有账密（缺省=不改）。
+        let response = service
+            .set_global_proxy(SetGlobalProxyRequest {
+                proxy_url: Some("http://proxy2.example.com:8080".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            })
+            .unwrap();
+        assert_eq!(response.proxy_username.as_deref(), Some("alice"));
+        assert!(response.proxy_password_set);
+
+        // 只清空密码、不动用户名：用户名密码必须成对，应被拒绝，而不是静默丢弃用户名。
+        let err = service
+            .set_global_proxy(SetGlobalProxyRequest {
+                proxy_url: Some("http://proxy2.example.com:8080".to_string()),
+                proxy_username: None,
+                proxy_password: Some(String::new()),
+            })
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        // 被拒绝后状态不变：用户名密码仍是 call 2 留下的 alice/s3cr3t。
+        let unchanged = service.get_global_proxy();
+        assert_eq!(unchanged.proxy_username.as_deref(), Some("alice"));
+        assert!(unchanged.proxy_password_set);
+
+        // 两者一起清空：允许，变成无认证代理。
+        let response = service
+            .set_global_proxy(SetGlobalProxyRequest {
+                proxy_url: Some("http://proxy2.example.com:8080".to_string()),
+                proxy_username: Some(String::new()),
+                proxy_password: Some(String::new()),
+            })
+            .unwrap();
+        assert!(response.proxy_username.is_none());
+        assert!(!response.proxy_password_set);
+
+        // proxy_url = None 清除整个全局代理，包括残留的 username。
+        let response = service
+            .set_global_proxy(SetGlobalProxyRequest {
+                proxy_url: None,
+                proxy_username: Some("ignored".to_string()),
+                proxy_password: None,
+            })
+            .unwrap();
+        assert!(response.proxy_url.is_none());
+        assert!(response.proxy_username.is_none());
+        assert!(!response.proxy_password_set);
+
+        let persisted = Config::load(&path).unwrap();
+        assert!(persisted.proxy_url.is_none());
+        assert!(persisted.proxy_username.is_none());
+        assert!(persisted.proxy_password.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn get_global_proxy_never_echoes_plaintext_password() {
+        let path = tmp_config_path("global_proxy_no_echo");
+        let service = build_service_with_config_path(&path);
+
+        service
+            .set_global_proxy(SetGlobalProxyRequest {
+                proxy_url: Some("http://proxy.example.com:8080".to_string()),
+                proxy_username: Some("alice".to_string()),
+                proxy_password: Some("s3cr3t".to_string()),
+            })
+            .unwrap();
+
+        let response = service.get_global_proxy();
+        assert!(response.proxy_password_set);
+        // GlobalProxyResponse 结构体本身不含明文密码字段，序列化后自然不可能出现，
+        // 这里额外校验 JSON 序列化结果里也没有密码字符串，双重保险。
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("s3cr3t"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
