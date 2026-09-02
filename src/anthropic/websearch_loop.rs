@@ -9,6 +9,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -18,6 +19,8 @@ use axum::{
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use tokio::time::interval;
 use uuid::Uuid;
 
 use crate::admin::trace_db::outcome;
@@ -29,12 +32,21 @@ use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::handlers::{
-    RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
+    RequestTracer, TraceUsage, UsageRecordHook, create_ping_sse, last_attempt_outcome,
+    map_provider_error,
 };
 use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 use crate::model::config::ToolCompatibilityMode;
+
+/// 多轮 web_search agentic loop 流式响应的进度队列容量：足够容纳"立即发送的
+/// message_start"与"循环结束后一次性发送的完整内容"两条消息，不需要更大。
+const WEB_SEARCH_CHANNEL_CAPACITY: usize = 4;
+
+/// 流式响应在等待多轮 web_search 循环跑完期间的 keep-alive ping 间隔（秒）。
+/// 与 `handlers.rs::create_sse_stream` 的 ping 间隔保持一致。
+const WEB_SEARCH_PING_INTERVAL_SECS: u64 = 25;
 
 /// Maximum number of search rounds, to prevent an infinite loop if the upstream keeps asking to search
 const MAX_WEB_SEARCH_ROUNDS: usize = 5;
@@ -779,18 +791,138 @@ fn finalize_aggregated_trace(
     );
 }
 
-/// web_search loop entry point
+/// web_search 多轮循环的用量 / trace 结算器。
 ///
-/// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
-pub(super) async fn run_web_search_loop(
-    provider: Arc<KiroProvider>,
-    mut payload: MessagesRequest,
+/// 与 `handlers.rs::StreamSettlement` 同一模式：把每一条终止路径原本手写的
+/// `record_aggregated_usage` + `finalize_aggregated_trace` 调用对收拢成一个类型的
+/// [`Self::finish`] 方法，并用 `Drop` 兜底——流式响应把整个循环放进后台
+/// `tokio::spawn` 任务后，客户端在循环跑完之前断连会导致这个任务被
+/// [`while_receiver_open`] 直接丢弃，若无 Drop 兜底，用量/credits 就会从未
+/// record、trace 也从未 finalize，成为悬空记录。
+struct WebSearchUsageSettlement {
     hook: UsageRecordHook,
     tracer: Arc<RequestTracer>,
-    stream_client: bool,
+    credential_id: u64,
+    usage: TokenUsage,
+    credits: f64,
+    settled: bool,
+}
+
+impl WebSearchUsageSettlement {
+    fn new(hook: UsageRecordHook, tracer: Arc<RequestTracer>) -> Self {
+        Self {
+            hook,
+            tracer,
+            credential_id: 0,
+            usage: TokenUsage::default(),
+            credits: 0.0,
+            settled: false,
+        }
+    }
+
+    /// 正常收尾路径调用：记账 + trace finalize，并标记已结算，避免 Drop 重复处理。
+    /// `credential_id` 为 0 时保留上一次记录的值（与循环内部 `last_credential_id`
+    /// 只在非零时更新的既有语义一致）。
+    fn finish(
+        &mut self,
+        credential_id: u64,
+        usage: TokenUsage,
+        credits: f64,
+        status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+    ) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        if credential_id != 0 {
+            self.credential_id = credential_id;
+        }
+        self.usage = usage;
+        self.credits = credits;
+        record_aggregated_usage(&self.hook, self.credential_id, self.usage, self.credits, status);
+        finalize_aggregated_trace(
+            self.tracer.as_ref(),
+            status,
+            error_type,
+            error_message,
+            self.usage,
+            self.credits,
+        );
+    }
+}
+
+impl Drop for WebSearchUsageSettlement {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        record_aggregated_usage(&self.hook, self.credential_id, self.usage, self.credits, "error");
+        finalize_aggregated_trace(
+            self.tracer.as_ref(),
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some("web_search loop was cancelled before completion"),
+            self.usage,
+            self.credits,
+        );
+    }
+}
+
+/// 供流式响应包裹后台循环 future：`sender` 对应的 SSE 响应流一旦被客户端断连
+/// （receiver 被 drop），`sender.closed()` 立即就绪，`future` 被直接丢弃——正在
+/// 进行中的上游请求 await 随之取消，不再浪费额度跑一次客户端已经不关心的搜索。
+/// 返回 `None` 表示因此被取消；`Some(output)` 表示 `future` 正常跑完。
+async fn while_receiver_open<F>(sender: &mpsc::Sender<Bytes>, future: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        output = future => Some(output),
+        _ = sender.closed() => None,
+    }
+}
+
+/// Result of the multi-round web_search agentic loop core, decoupled from how it
+/// gets rendered to the client (single JSON, one-shot SSE burst behind keep-alive
+/// pings — see `run_web_search_loop`).
+enum WebSearchLoopOutcome {
+    Success {
+        content: Vec<Value>,
+        stop_reason: String,
+        final_usage: TokenUsage,
+        all_thinking: String,
+        metering: Option<MeteringEvent>,
+    },
+    Failure {
+        /// Ready-to-return response for the non-streaming caller (exact status code +
+        /// JSON body it always returned before this refactor).
+        response: Response,
+        /// Same failure, in a shape the streaming caller can turn into an SSE `error`
+        /// event once the response has already committed to `text/event-stream`.
+        error_type: Option<&'static str>,
+        error_message: String,
+    },
+}
+
+/// web_search loop core: runs the multi-round agentic loop to completion (or to a
+/// terminal failure) and returns the outcome without deciding how to render it.
+///
+/// Usage/trace settlement happens exactly once via `settlement.finish(..)` on every
+/// terminal path; the caller is responsible for constructing the settlement (so a
+/// streaming caller can let `Drop` catch a cancelled-in-flight loop — see
+/// `WebSearchUsageSettlement`).
+async fn run_web_search_loop_core(
+    provider: Arc<KiroProvider>,
+    mut payload: MessagesRequest,
+    tracer: Arc<RequestTracer>,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
-) -> Response {
+    settlement: &mut WebSearchUsageSettlement,
+) -> WebSearchLoopOutcome {
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
     let mut total_token_usage = TokenUsage::default();
@@ -826,22 +958,19 @@ pub(super) async fn run_web_search_loop(
                         total_token_usage = total_token_usage.saturating_add(usage);
                     }
                     total_credits += failure.credits;
-                    record_aggregated_usage(
-                        &hook,
+                    settlement.finish(
                         last_credential_id,
                         total_token_usage,
                         total_credits,
                         "error",
-                    );
-                    finalize_aggregated_trace(
-                        tracer.as_ref(),
-                        "error",
                         Some(failure.error_type),
                         Some(&failure.error_message),
-                        total_token_usage,
-                        total_credits,
                     );
-                    return failure.response;
+                    return WebSearchLoopOutcome::Failure {
+                        response: failure.response,
+                        error_type: Some(failure.error_type),
+                        error_message: failure.error_message,
+                    };
                 }
             };
             last_credential_id = credential_id;
@@ -866,36 +995,30 @@ pub(super) async fn run_web_search_loop(
                     continue;
                 }
                 EmptyToolResultDisposition::Fail => {
-                    record_aggregated_usage(
-                        &hook,
+                    let error_message =
+                        "Upstream returned no assistant text or tool call after a tool result."
+                            .to_string();
+                    settlement.finish(
                         last_credential_id,
                         total_token_usage,
                         total_credits,
                         "error",
-                    );
-                    finalize_aggregated_trace(
-                        tracer.as_ref(),
-                        "error",
                         Some(outcome::UNKNOWN),
-                        Some(
-                            "Upstream returned no assistant text or tool call after a tool result.",
-                        ),
-                        total_token_usage,
-                        total_credits,
+                        Some(&error_message),
                     );
                     tracing::error!(
                         round = round_idx,
                         "upstream repeated an empty assistant turn after tool_result"
                     );
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(ErrorResponse::new(
-                            "upstream_error",
-                            "Upstream returned no assistant text or tool call after a tool result."
-                                .to_string(),
-                        )),
-                    )
-                        .into_response();
+                    return WebSearchLoopOutcome::Failure {
+                        response: (
+                            StatusCode::BAD_GATEWAY,
+                            Json(ErrorResponse::new("upstream_error", error_message.clone())),
+                        )
+                            .into_response(),
+                        error_type: Some(outcome::UNKNOWN),
+                        error_message,
+                    };
                 }
             }
 
@@ -942,22 +1065,20 @@ pub(super) async fn run_web_search_loop(
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
                         let error_message = e.to_string();
-                        record_aggregated_usage(
-                            &hook,
+                        let error_type = last_attempt_outcome(tracer.as_ref());
+                        settlement.finish(
                             last_credential_id,
                             total_token_usage,
                             total_credits,
                             "error",
-                        );
-                        finalize_aggregated_trace(
-                            tracer.as_ref(),
-                            "error",
-                            last_attempt_outcome(tracer.as_ref()),
+                            error_type,
                             Some(&error_message),
-                            total_token_usage,
-                            total_credits,
                         );
-                        return map_provider_error(e);
+                        return WebSearchLoopOutcome::Failure {
+                            response: map_provider_error(e),
+                            error_type,
+                            error_message,
+                        };
                     }
                 }
             }
@@ -1006,22 +1127,20 @@ pub(super) async fn run_web_search_loop(
                     Err(e) => {
                         tracing::warn!("web_search MCP call (final round) failed: {}", e);
                         let error_message = e.to_string();
-                        record_aggregated_usage(
-                            &hook,
+                        let error_type = last_attempt_outcome(tracer.as_ref());
+                        settlement.finish(
                             last_credential_id,
                             total_token_usage,
                             total_credits,
                             "error",
-                        );
-                        finalize_aggregated_trace(
-                            tracer.as_ref(),
-                            "error",
-                            last_attempt_outcome(tracer.as_ref()),
+                            error_type,
                             Some(&error_message),
-                            total_token_usage,
-                            total_credits,
                         );
-                        return map_provider_error(e);
+                        return WebSearchLoopOutcome::Failure {
+                            response: map_provider_error(e),
+                            error_type,
+                            error_message,
+                        };
                     }
                 }
             } else {
@@ -1047,66 +1166,163 @@ pub(super) async fn run_web_search_loop(
         );
 
         let final_usage = total_token_usage.sanitized();
-        record_aggregated_usage(
-            &hook,
+        settlement.finish(
             last_credential_id,
             final_usage,
             total_credits,
             "success",
-        );
-        finalize_aggregated_trace(
-            tracer.as_ref(),
-            "success",
             None,
             None,
-            final_usage,
-            total_credits,
         );
 
-        return if stream_client {
-            render_sse(
-                &payload.model,
-                content,
-                &stop_reason,
-                final_usage,
-                latest_metering.as_ref(),
-            )
-        } else {
-            render_json(
-                &payload.model,
-                content,
-                &stop_reason,
-                final_usage,
-                &all_thinking,
-                latest_metering.as_ref(),
-            )
+        return WebSearchLoopOutcome::Success {
+            content,
+            stop_reason,
+            final_usage,
+            all_thinking,
+            metering: latest_metering,
         };
     }
 
     // Theoretically unreachable (the loop always returns)
-    record_aggregated_usage(
-        &hook,
+    let error_message = "web_search loop exited unexpectedly".to_string();
+    settlement.finish(
         last_credential_id,
         total_token_usage,
         total_credits,
         "error",
-    );
-    finalize_aggregated_trace(
-        tracer.as_ref(),
-        "error",
         Some(outcome::UNKNOWN),
-        Some("web_search loop exited unexpectedly"),
-        total_token_usage,
-        total_credits,
+        Some(&error_message),
     );
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse::new(
-            "internal_error",
-            "web_search loop exited unexpectedly",
-        )),
-    )
-        .into_response()
+    WebSearchLoopOutcome::Failure {
+        response: (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new("internal_error", error_message.clone())),
+        )
+            .into_response(),
+        error_type: Some(outcome::UNKNOWN),
+        error_message,
+    }
+}
+
+/// web_search loop entry point.
+///
+/// `stream_client`: whether the client wants SSE (true) or a single JSON response
+/// (false).
+///
+/// Streaming responses no longer wait for the entire multi-round loop to finish
+/// before sending any bytes: the loop runs in a background task while the client
+/// immediately gets an initial `message_start` event followed by 25s keep-alive
+/// pings, then the full content once the loop completes (or an `error` event if it
+/// fails). This prevents long multi-round searches from going silent long enough
+/// for the client (e.g. Codex) to judge the connection dead and disconnect.
+///
+/// This is a lighter-weight fix than upstream's fully incremental per-search block
+/// streaming: content is still assembled in one shot at the end (unchanged
+/// `build_flush_content`/`remaining_sse_events` logic, zero risk of content-ordering
+/// drift), only the *timing* of when bytes start flowing changed. It solves the
+/// actual reported problem (silence -> disconnect) without touching the
+/// well-tested content-building pipeline.
+pub(super) async fn run_web_search_loop(
+    provider: Arc<KiroProvider>,
+    payload: MessagesRequest,
+    hook: UsageRecordHook,
+    tracer: Arc<RequestTracer>,
+    stream_client: bool,
+    group: Option<String>,
+    tool_compatibility_mode: ToolCompatibilityMode,
+) -> Response {
+    let model = payload.model.clone();
+
+    if !stream_client {
+        let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
+        return match run_web_search_loop_core(
+            provider,
+            payload,
+            tracer,
+            group,
+            tool_compatibility_mode,
+            &mut settlement,
+        )
+        .await
+        {
+            WebSearchLoopOutcome::Success {
+                content,
+                stop_reason,
+                final_usage,
+                all_thinking,
+                metering,
+            } => render_json(
+                &model,
+                content,
+                &stop_reason,
+                final_usage,
+                &all_thinking,
+                metering.as_ref(),
+            ),
+            WebSearchLoopOutcome::Failure { response, .. } => response,
+        };
+    }
+
+    // Streaming: respond immediately (message_start + keep-alive pings), run the
+    // loop in a spawned task, flush everything through the channel once it's done.
+    let initial_input_tokens = token::count_all_tokens(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
+    ) as i32;
+    let initial_bytes =
+        Bytes::from(initial_message_start_event(&model, initial_input_tokens).to_sse_string());
+
+    let (tx, rx) = mpsc::channel::<Bytes>(WEB_SEARCH_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
+        let outcome = while_receiver_open(
+            &tx,
+            run_web_search_loop_core(
+                provider,
+                payload,
+                tracer,
+                group,
+                tool_compatibility_mode,
+                &mut settlement,
+            ),
+        )
+        .await;
+        // `None`: the client disconnected before the loop finished. `settlement`'s
+        // Drop (about to run as this task ends) records the interrupted usage/trace;
+        // there is no one left to send bytes to.
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let bytes = match outcome {
+            WebSearchLoopOutcome::Success {
+                content,
+                stop_reason,
+                final_usage,
+                metering,
+                ..
+            } => {
+                let mut buf = String::new();
+                for event in remaining_sse_events(content, &stop_reason, final_usage, metering.as_ref()) {
+                    buf.push_str(&event.to_sse_string());
+                }
+                Bytes::from(buf)
+            }
+            WebSearchLoopOutcome::Failure {
+                error_type,
+                error_message,
+                ..
+            } => Bytes::from(
+                error_sse_event(error_type.unwrap_or(outcome::UNKNOWN), &error_message)
+                    .to_sse_string(),
+            ),
+        };
+        let _ = tx.send(bytes).await;
+    });
+
+    render_channel_sse(initial_bytes, rx)
 }
 
 /// Single JSON response (non-streaming)
@@ -1154,42 +1370,17 @@ pub(crate) fn render_json(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// SSE response (streaming): splits the final content into a sequence of Anthropic content_block events
-pub(crate) fn render_sse(
-    model: &str,
-    content: Vec<Value>,
-    stop_reason: &str,
-    token_usage: TokenUsage,
-    metering: Option<&MeteringEvent>,
-) -> Response {
-    let events = build_sse_events(model, content, stop_reason, token_usage, metering);
-    let stream = stream::iter(
-        events
-            .into_iter()
-            .map(|e| Ok::<Bytes, Infallible>(Bytes::from(e.to_sse_string()))),
-    );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-/// Renders the final content array into a sequence of SSE events
-fn build_sse_events(
-    model: &str,
-    content: Vec<Value>,
-    stop_reason: &str,
-    token_usage: TokenUsage,
-    metering: Option<&MeteringEvent>,
-) -> Vec<SseEvent> {
-    let token_usage = token_usage.sanitized();
-    let mut events = Vec::new();
+/// Builds the `message_start` event sent immediately when a streaming web_search
+/// loop request is accepted — before the loop has run even a single round.
+///
+/// Unlike the old one-shot `build_sse_events` (which folded the final, fully
+/// accurate `token_usage` into `message_start`), this only has a rough input-token
+/// estimate available at this point; `output_tokens`/cache fields are zeroed and
+/// refined later by `message_delta`. This actually matches real Anthropic streaming
+/// semantics more closely than the old all-at-once render did.
+fn initial_message_start_event(model: &str, input_tokens: i32) -> SseEvent {
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
-
-    events.push(SseEvent::new(
+    SseEvent::new(
         "message_start",
         json!({
             "type": "message_start",
@@ -1202,14 +1393,43 @@ fn build_sse_events(
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": token_usage.uncached_input_tokens,
+                    "input_tokens": input_tokens.max(0),
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": token_usage.cache_write_input_tokens,
-                    "cache_read_input_tokens": token_usage.cache_read_input_tokens
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
                 }
             }
         }),
-    ));
+    )
+}
+
+/// Renders an Anthropic `error` SSE event.
+fn error_sse_event(error_type: &str, message: &str) -> SseEvent {
+    SseEvent::new(
+        "error",
+        json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message
+            }
+        }),
+    )
+}
+
+/// Builds the SSE events for the loop's final flush: content blocks, then
+/// message_delta and message_stop. Does NOT include `message_start` — that is sent
+/// separately and immediately by `run_web_search_loop`'s streaming branch, before
+/// the loop even starts, so the client sees bytes right away instead of waiting for
+/// every round to finish.
+fn remaining_sse_events(
+    content: Vec<Value>,
+    stop_reason: &str,
+    token_usage: TokenUsage,
+    metering: Option<&MeteringEvent>,
+) -> Vec<SseEvent> {
+    let token_usage = token_usage.sanitized();
+    let mut events = Vec::new();
 
     for (index, block) in content.iter().enumerate() {
         let index = index as i32;
@@ -1306,10 +1526,125 @@ fn build_sse_events(
     events
 }
 
+/// Builds the streaming HTTP response for a web_search loop request: sends
+/// `initial_bytes` (the `message_start` event) right away, then relays whatever the
+/// background loop task sends through `receiver`, interleaved with a 25s keep-alive
+/// ping whenever neither side has anything to say — same `stream::unfold` +
+/// `tokio::select!` shape as `handlers.rs::create_sse_stream`'s ping loop.
+fn render_channel_sse(initial_bytes: Bytes, receiver: mpsc::Receiver<Bytes>) -> Response {
+    let initial_stream = stream::iter(vec![Ok::<Bytes, Infallible>(initial_bytes)]);
+
+    let relay_stream = stream::unfold(
+        (
+            receiver,
+            interval(Duration::from_secs(WEB_SEARCH_PING_INTERVAL_SECS)),
+        ),
+        |(mut receiver, mut ping_interval)| async move {
+            tokio::select! {
+                msg = receiver.recv() => msg.map(|bytes| {
+                    (Ok::<Bytes, Infallible>(bytes), (receiver, ping_interval))
+                }),
+                _ = ping_interval.tick() => {
+                    Some((Ok(create_ping_sse()), (receiver, ping_interval)))
+                }
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(initial_stream.chain(relay_stream)))
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::trace_db::{TraceQuery, TraceStore};
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
+
+    fn test_hook() -> UsageRecordHook {
+        UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 1,
+            model: "test-model".to_string(),
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    // ---- while_receiver_open: 取消传播 ----
+
+    #[tokio::test]
+    async fn while_receiver_open_returns_output_when_future_wins() {
+        let (tx, rx) = mpsc::channel::<Bytes>(1);
+        let result = while_receiver_open(&tx, async { 42 }).await;
+        assert_eq!(result, Some(42));
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn while_receiver_open_returns_none_when_receiver_already_dropped() {
+        let (tx, rx) = mpsc::channel::<Bytes>(1);
+        drop(rx);
+        // future 永不完成：只有 receiver 关闭才能让 select! 返回。
+        let result = while_receiver_open(&tx, std::future::pending::<()>()).await;
+        assert_eq!(result, None);
+    }
+
+    // ---- WebSearchUsageSettlement: Drop 兜底 ----
+
+    #[test]
+    fn dropped_settlement_records_interrupted_exactly_once() {
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = std::sync::Arc::new(RequestTracer::for_test(
+            Some(store.clone()),
+            "test-model",
+        ));
+
+        {
+            let mut settlement = WebSearchUsageSettlement::new(test_hook(), tracer.clone());
+            settlement.credential_id = 7;
+            settlement.usage = token_usage(10, 5);
+            settlement.credits = 0.5;
+            // 客户端在这里断开：settlement 没有走 finish()，直接被 drop。
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            model: Some("test-model".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "Drop 应且只应补记一条 trace");
+        assert_eq!(records[0].final_status, "interrupted");
+    }
+
+    #[test]
+    fn finished_settlement_is_not_double_recorded_on_drop() {
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = std::sync::Arc::new(RequestTracer::for_test(
+            Some(store.clone()),
+            "test-model",
+        ));
+
+        {
+            let mut settlement = WebSearchUsageSettlement::new(test_hook(), tracer.clone());
+            settlement.finish(7, token_usage(10, 5), 0.5, "success", None, None);
+            // 正常收尾后立即 drop：不应再补记一条 interrupted。
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            model: Some("test-model".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "finish() 之后 Drop 不应重复记账");
+        assert_eq!(records[0].final_status, "success");
+    }
 
     fn tu(name: &str) -> CompletedToolUse {
         CompletedToolUse {
@@ -1588,7 +1923,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
-    // ---- build_sse_events: present server_tool_use + result, and the exec tool_use is not swallowed ----
+    // ---- remaining_sse_events: present server_tool_use + result, and the exec tool_use is not swallowed ----
 
     #[test]
     fn sse_events_render_search_presentation_and_keep_exec() {
@@ -1598,16 +1933,12 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events(
-            "claude-sonnet-4-8",
-            content,
-            "tool_use",
-            token_usage(10, 5),
-            None,
-        );
+        let events = remaining_sse_events(content, "tool_use", token_usage(10, 5), None);
 
-        // Must contain message_start / message_delta(stop_reason) / message_stop
-        assert_eq!(events.first().unwrap().event, "message_start");
+        // message_start is sent separately/earlier (see initial_message_start_event);
+        // remaining_sse_events starts directly with the first content block and ends
+        // with message_delta(stop_reason)/message_stop.
+        assert_eq!(events.first().unwrap().event, "content_block_start");
         assert_eq!(events.last().unwrap().event, "message_stop");
         let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
         assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
@@ -2262,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn json_and_sse_render_the_same_four_part_usage() {
+    fn json_and_sse_render_the_same_usage() {
         let expected = TokenUsage {
             uncached_input_tokens: 3,
             output_tokens: 5,
@@ -2289,21 +2620,27 @@ mod tests {
         assert_eq!(body["usage"]["cache_creation_input_tokens"], json!(4));
         assert_eq!(body["usage"]["cache_read_input_tokens"], json!(7));
 
-        let events = build_sse_events("claude-opus-4-7", content, "end_turn", expected, None);
-        let start_usage = &events
-            .iter()
-            .find(|event| event.event == "message_start")
-            .unwrap()
-            .data["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], json!(3));
-        assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
-        assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
+        // remaining_sse_events no longer carries message_start (sent separately,
+        // immediately, with only a rough input-token estimate — see
+        // initial_message_start_event); message_delta's output_tokens must still
+        // match the same final usage render_json used.
+        let events = remaining_sse_events(content, "end_turn", expected, None);
         let delta_usage = &events
             .iter()
             .find(|event| event.event == "message_delta")
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(5));
+    }
+
+    #[test]
+    fn initial_message_start_event_carries_rough_input_estimate() {
+        let event = initial_message_start_event("claude-opus-4-7", 42);
+        assert_eq!(event.event, "message_start");
+        let usage = &event.data["message"]["usage"];
+        assert_eq!(usage["input_tokens"], json!(42));
+        assert_eq!(usage["output_tokens"], json!(0));
+        assert_eq!(event.data["message"]["model"], "claude-opus-4-7");
     }
 
     // ---- credit_usage 透传：run_web_search_loop 路径 ----
@@ -2375,16 +2712,10 @@ mod tests {
     }
 
     #[test]
-    fn build_sse_events_carries_credit_fields_in_message_delta() {
+    fn remaining_sse_events_carries_credit_fields_in_message_delta() {
         let content = vec![json!({"type": "text", "text": "ok"})];
         let metering = metering_event(0.99);
-        let events = build_sse_events(
-            "claude-opus-4-7",
-            content,
-            "end_turn",
-            token_usage(10, 5),
-            Some(&metering),
-        );
+        let events = remaining_sse_events(content, "end_turn", token_usage(10, 5), Some(&metering));
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -2398,15 +2729,9 @@ mod tests {
     }
 
     #[test]
-    fn build_sse_events_omits_credit_fields_without_metering() {
+    fn remaining_sse_events_omits_credit_fields_without_metering() {
         let content = vec![json!({"type": "text", "text": "ok"})];
-        let events = build_sse_events(
-            "claude-opus-4-7",
-            content,
-            "end_turn",
-            token_usage(10, 5),
-            None,
-        );
+        let events = remaining_sse_events(content, "end_turn", token_usage(10, 5), None);
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
