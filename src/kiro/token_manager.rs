@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{RpmLimitExhaustedError, UpstreamRateLimitError};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
@@ -1493,6 +1493,19 @@ fn is_rpm_exceeded(entry: &CredentialEntry, now: Instant) -> bool {
     rpm_window_count(entry, now) >= limit
 }
 
+/// 该账号 RPM 超限时，距离窗口内最早一条请求过期（从而腾出一个配额）还有多久，
+/// 用作 429 响应的 `Retry-After` 建议值。返回 `None` 表示队列里没有窗口内的记录
+/// （理论上不应该发生：超限意味着窗口内至少有 `rpm_limit` 条）。
+fn rpm_retry_after_secs(entry: &CredentialEntry, now: Instant) -> Option<u64> {
+    let cutoff = now.checked_sub(RPM_WINDOW);
+    let &oldest_in_window = entry
+        .recent_requests
+        .iter()
+        .find(|&&t| cutoff.map(|c| t > c).unwrap_or(true))?;
+    let expires_at = oldest_in_window + RPM_WINDOW;
+    Some(expires_at.saturating_duration_since(now).as_secs().max(1))
+}
+
 fn cooldown_remaining_ms(until: Option<Instant>, now: Instant) -> Option<u64> {
     until
         .and_then(|t| t.checked_duration_since(now))
@@ -2242,11 +2255,33 @@ impl MultiTokenManager {
                     (new_id, new_creds)
                 } else {
                     let entries = self.entries.lock();
-                    // 注意：必须在 bail! 之前计算 available_count，
-                    // 因为 available_count() 会尝试获取 entries 锁，
+                    let now = Instant::now();
+                    // 注意：必须在返回错误之前完成所有基于 entries 的判断，
+                    // 因为下面用到的 available_count() 等方法会尝试获取 entries 锁，
                     // 而此时我们已经持有该锁，会导致死锁
-                    let available = entries.iter().filter(|e| !e.disabled).count();
-                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                    let relevant: Vec<&CredentialEntry> = entries
+                        .iter()
+                        .filter(|e| credential_matches_request(&e.credentials, model, group))
+                        .collect();
+                    let not_disabled: Vec<&CredentialEntry> =
+                        relevant.iter().copied().filter(|e| !e.disabled).collect();
+
+                    // 未禁用的凭据是否清一色卡在 RPM（而非账号风控冷却/模型不支持等其它
+                    // 原因）？只有这种情况才是"自设限速正在生效"：客户端应当退避重试，
+                    // 而不是被当成上游故障（502），也不应该被误报为"凭据已禁用"
+                    // （它们在 entries 里其实都没被禁用）。
+                    if !not_disabled.is_empty()
+                        && not_disabled.iter().all(|e| is_rpm_exceeded(e, now))
+                    {
+                        let retry_after_secs = not_disabled
+                            .iter()
+                            .filter_map(|e| rpm_retry_after_secs(e, now))
+                            .min()
+                            .unwrap_or(1);
+                        return Err(RpmLimitExhaustedError::new(retry_after_secs).into());
+                    }
+
+                    anyhow::bail!("所有凭据均已禁用（{}/{}）", not_disabled.len(), total);
                 };
 
                 (id, credentials, is_balanced)
@@ -2729,25 +2764,37 @@ impl MultiTokenManager {
 
     /// 记录一次「对该账号上游发起请求」，用于 RPM 滑动窗口计数。
     ///
-    /// push now 到队尾，并从队首剔除所有超过 60s 的过期时间戳。
+    /// 检查（是否已达限）与计入（push 时间戳）在同一次加锁内原子完成：调用方在
+    /// `acquire_context` 阶段做过一次预检查（`is_rpm_exceeded`），但预检查和这里
+    /// 之间隔着一次可能的 token 刷新 `await`，并发请求可能都通过了预检查——这里的
+    /// 原子重检是最终防线。返回 `false` 表示这个名额已被并发请求抢占，调用方必须
+    /// 放弃使用这个凭据（不能假装记账成功继续发请求），应排除后重新选择。
+    ///
+    /// push now 到队尾前，先从队首剔除所有超过 60s 的过期时间戳。
     /// 由 provider 在「会话级首次用到该凭据」时调用一次（同凭据重试不重复记，
     /// 故障转移到新凭据时各记一次）。必须在未持有 entries 锁时调用。
-    pub(crate) fn record_request(&self, id: u64) {
+    #[must_use = "false 表示该凭据的 RPM 配额已被并发请求抢占，调用方必须放弃使用它"]
+    pub(crate) fn record_request(&self, id: u64) -> bool {
         let now = Instant::now();
         let cutoff = now.checked_sub(RPM_WINDOW);
         let mut entries = self.entries.lock();
-        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
-            if let Some(c) = cutoff {
-                while let Some(&front) = e.recent_requests.front() {
-                    if front <= c {
-                        e.recent_requests.pop_front();
-                    } else {
-                        break;
-                    }
+        let Some(e) = entries.iter_mut().find(|e| e.id == id) else {
+            return true; // 凭据已被删除，没有 RPM 状态可言，不阻塞调用方
+        };
+        if let Some(c) = cutoff {
+            while let Some(&front) = e.recent_requests.front() {
+                if front <= c {
+                    e.recent_requests.pop_front();
+                } else {
+                    break;
                 }
             }
-            e.recent_requests.push_back(now);
         }
+        if is_rpm_exceeded(e, now) {
+            return false;
+        }
+        e.recent_requests.push_back(now);
+        true
     }
 
     /// 为指定凭据构造 in-flight RAII 守卫（provider 用其持有的 Arc 调用）。
@@ -6274,7 +6321,7 @@ mod tests {
             assert_eq!(rpm_window_count(e, now), 2);
         }
         // record_request 会剔除过期项
-        manager.record_request(1);
+        assert!(manager.record_request(1));
         {
             let entries = manager.entries.lock();
             let e = entries.iter().find(|e| e.id == 1).unwrap();
@@ -6374,6 +6421,93 @@ mod tests {
         assert!(
             manager.select_next_credential(None, None).is_none(),
             "全部达限应返回 None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_returns_typed_rpm_error_when_all_exhausted() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for e in entries.iter_mut() {
+                e.credentials.rpm_limit = 2;
+                e.recent_requests.push_back(now);
+                e.recent_requests.push_back(now);
+            }
+        }
+
+        let err = manager.acquire_context(None, None).await.err().unwrap();
+        let rpm_err = err
+            .downcast_ref::<crate::kiro::error::RpmLimitExhaustedError>()
+            .expect("全部凭据均因 RPM 超限时应返回类型化 RpmLimitExhaustedError，而非普通 502 错误");
+        assert!(rpm_err.retry_after_secs() > 0);
+        // 不应误报为"已禁用"——这两张凭据都没被 disabled，只是 RPM 超限。
+        assert!(!err.to_string().contains("已禁用"));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_disabled_message_unaffected_by_rpm_check() {
+        // 真正全部 disabled（非 RPM 超限）时，报错措辞保持不变，不应被误判为 RPM 场景。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            for e in entries.iter_mut() {
+                e.disabled = true;
+            }
+        }
+
+        let err = manager.acquire_context(None, None).await.err().unwrap();
+        assert!(
+            err.downcast_ref::<crate::kiro::error::RpmLimitExhaustedError>()
+                .is_none(),
+            "真正全部禁用时不应返回 RPM 类型化错误"
+        );
+        assert!(err.to_string().contains("所有凭据均已禁用"));
+    }
+
+    #[test]
+    fn test_record_request_rejects_when_window_already_full() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries.iter_mut().find(|e| e.id == 1).unwrap().credentials.rpm_limit = 1;
+        }
+
+        // 模拟并发请求已经抢先记满窗口：第一次记账成功，第二次（原子重检）应被拒绝，
+        // 而不是无视上限继续 push。
+        assert!(manager.record_request(1), "窗口未满，第一次应成功");
+        assert!(
+            !manager.record_request(1),
+            "窗口已满，第二次原子重检应拒绝而不是静默超发"
+        );
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            e.recent_requests.len(),
+            1,
+            "被拒绝的记账不应把时间戳 push 进队列"
         );
     }
 

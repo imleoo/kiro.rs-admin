@@ -32,6 +32,29 @@ impl UpstreamRateLimitError {
     }
 }
 
+/// All credentials available for this request have hit their locally configured
+/// per-account RPM budget (`KiroCredentials::rpm_limit`). This is a self-imposed
+/// limit, not an upstream rejection, but the client still needs to back off and
+/// retry — so it is surfaced to callers the same way as [`UpstreamRateLimitError`]
+/// (429 + `Retry-After`) instead of falling through to a generic 5xx.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("all available credentials have hit their configured RPM limit")]
+pub struct RpmLimitExhaustedError {
+    retry_after_secs: u64,
+}
+
+impl RpmLimitExhaustedError {
+    pub(crate) fn new(retry_after_secs: u64) -> Self {
+        Self {
+            retry_after_secs: retry_after_secs.max(1),
+        }
+    }
+
+    pub fn retry_after_secs(&self) -> u64 {
+        self.retry_after_secs
+    }
+}
+
 fn normalize_retry_after(value: String) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {

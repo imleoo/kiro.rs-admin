@@ -16,7 +16,7 @@ use crate::admin::trace_db::{TraceAttempt, TraceSink, TraceStage, outcome, trunc
 use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{RpmLimitExhaustedError, UpstreamRateLimitError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -758,7 +758,8 @@ impl KiroProvider {
             .acquire_context_for_id(credential_id)
             .await?;
         let _in_flight = self.token_manager.in_flight_guard(ctx.id);
-        self.token_manager.record_request(ctx.id);
+        // 管理员显式测试单个凭据，不参与 RPM 故障转移，记账失败与否都不阻塞本次调用。
+        let _ = self.token_manager.record_request(ctx.id);
         self.ensure_profile_arn(&mut ctx).await?;
 
         let config = self.token_manager.config();
@@ -877,9 +878,30 @@ impl KiroProvider {
             // least_conn 在途计数守卫：随本次迭代作用域结束自动 -1（具名绑定，勿用裸 `_`）。
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
-            // RPM 记账：本会话首次用到该凭据才记 1 次。
-            if rpm_recorded.insert(ctx.id) {
-                self.token_manager.record_request(ctx.id);
+            // RPM 记账：本会话首次用到该凭据才记 1 次。record_request 与选择时的预检查
+            // 之间隔着一次可能的 token 刷新 await，并发请求可能都通过了预检查——这里原子
+            // 重检失败（配额被并发请求抢占）时必须放弃这个凭据，排除后重选，而不是假装
+            // 记账成功继续发请求。
+            if rpm_recorded.insert(ctx.id) && !self.token_manager.record_request(ctx.id) {
+                rpm_recorded.remove(&ctx.id);
+                request_throttled_ids.insert(ctx.id);
+                tracing::warn!(
+                    "MCP 凭据 #{} RPM 配额被并发请求抢占（尝试 {}/{}），排除后重选",
+                    ctx.id,
+                    attempt + 1,
+                    max_retries
+                );
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    "",
+                    None,
+                    outcome::ACCOUNT_THROTTLED,
+                    Some("RPM quota was claimed by a concurrent request"),
+                    attempt_start,
+                );
+                continue;
             }
 
             // Pure MCP routes (including Web Search) require the same Enterprise / IdC
@@ -1268,9 +1290,30 @@ impl KiroProvider {
             // （return/continue/bail!/? 早退）。必须具名绑定，裸 `_` 会立即 Drop。
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
-            // RPM 记账：本会话首次用到该凭据才记 1 次（同凭据重试不再记）。
-            if rpm_recorded.insert(ctx.id) {
-                self.token_manager.record_request(ctx.id);
+            // RPM 记账：本会话首次用到该凭据才记 1 次（同凭据重试不再记）。record_request
+            // 与选择时的预检查之间隔着一次可能的 token 刷新 await，并发请求可能都通过了
+            // 预检查——这里原子重检失败（配额被并发请求抢占）时必须放弃这个凭据，排除后
+            // 重选，而不是假装记账成功继续发请求。
+            if rpm_recorded.insert(ctx.id) && !self.token_manager.record_request(ctx.id) {
+                rpm_recorded.remove(&ctx.id);
+                request_throttled_ids.insert(ctx.id);
+                tracing::warn!(
+                    "凭据 #{} RPM 配额被并发请求抢占（尝试 {}/{}），排除后重选",
+                    ctx.id,
+                    attempt + 1,
+                    max_retries
+                );
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    "",
+                    None,
+                    outcome::ACCOUNT_THROTTLED,
+                    Some("RPM quota was claimed by a concurrent request"),
+                    attempt_start,
+                );
+                continue;
             }
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
@@ -2050,6 +2093,7 @@ impl KiroProvider {
 
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
+        || error.downcast_ref::<RpmLimitExhaustedError>().is_some()
 }
 
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
