@@ -194,15 +194,17 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
 修法是把 `record_request` 改成返回 `bool`、在拿到 token 成功后在同一把锁内原子重检，
 失败则重新选号；额度耗尽时返回带 `Retry-After` 的类型化 429，而不是裸 `bail!`。
 
-**本仓库的 per-account 实现目前存在同一类问题**（`is_rpm_exceeded` 检查与
+**本仓库的 per-account 实现曾存在同一类问题**（`is_rpm_exceeded` 检查与
 `provider.rs` 里的 `record_request` 调用点是分离的两步，非原子），且全账号 RPM 耗尽时
-的错误路径未确认是否已是类型化 429 + `Retry-After`。这不是这次合并引入的回归（本地设计
-一直如此），不在"合并上游"范围内顺手改掉，但记在这里作为后续独立待办：
-1. 评估 `is_rpm_exceeded` 检查 + `record_request` 记账之间的 TOCTOU 窗口是否需要收紧
-   为原子操作（可参考 upstream `da4829d` 的思路，但要适配本地 per-credential 而非全局的
-   数据结构）。
-2. 确认全账号 RPM 耗尽时返回的错误是否已经是类型化限流错误（`UpstreamRateLimitError` 或
-   等价类型）并带 `Retry-After`，而不是被吞成普通 5xx/无 Retry-After 的 429。
+的错误路径此前不是类型化 429 + `Retry-After`。这不是合并引入的回归（本地设计一直如此），
+**已于独立提交 `a16e7ac` 修复**（与上游同步无关，是复核本文档时发现的本地技术债）：
+1. `record_request` 改为在同一把 `entries` 锁内原子完成"检查是否已达限"+"push 时间戳"，
+   返回 `bool`；`provider.rs` 的两处重试循环在原子重检失败（名额被并发请求抢占）时排除
+   该凭据、重新选择，不再假装记账成功继续发请求——采用了与 upstream `da4829d` 相同的思路，
+   适配本地 per-credential（而非全局）的数据结构。
+2. 新增类型化 `RpmLimitExhaustedError`（带 `retry_after_secs`），仅当所有未禁用的相关
+   凭据清一色卡在 RPM 时返回，`map_provider_error` 映射为 429 + `Retry-After`；同时修正了
+   此前"所有凭据均已禁用"这条错误消息在纯 RPM 场景下的误报（这些凭据根本没被禁用）。
 
 **合并上游时的检查点**：如果未来 upstream-kiro 再次改动 `account_rpm_limit_enabled`/
 `account_rpm_limit`/`rpm_window`/`rpm_exceeded` 这套全局 RPM 逻辑，先确认本地

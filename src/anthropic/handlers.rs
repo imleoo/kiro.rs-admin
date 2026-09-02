@@ -373,6 +373,28 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         return response;
     }
 
+    if let Some(rpm_exhausted) =
+        err.downcast_ref::<crate::kiro::error::RpmLimitExhaustedError>()
+    {
+        tracing::warn!(error = %err, "全部可用凭据均已达 RPM 上限（映射为 429）");
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "All available credentials have hit their configured RPM limit. Retry later.",
+            )),
+        )
+            .into_response();
+        if let Ok(value) = rpm_exhausted
+            .retry_after_secs()
+            .to_string()
+            .parse::<header::HeaderValue>()
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -2533,6 +2555,15 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn rpm_limit_exhausted_maps_to_429_with_retry_after() {
+        let err = crate::kiro::error::RpmLimitExhaustedError::new(42);
+        let resp = map_provider_error(err.into());
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "42");
     }
 
     #[tokio::test]
