@@ -455,6 +455,19 @@ fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
     }
 }
 
+/// 非流式响应是否应从 Kiro 返回文本里提取 thinking 块。
+///
+/// 全局开关（`state.extract_thinking`）关闭时，客户端如果通过 `output_config`
+/// （如 Codex 传 `reasoning_effort`）显式要求了 reasoning，也不应把 thinking 部分
+/// 静默吞掉——客户端明确要了，就该给，不受管理员未开启全局提取开关影响。
+fn effective_extract_thinking(
+    global_enabled: bool,
+    output_config_requested: bool,
+    thinking_enabled: bool,
+) -> bool {
+    (global_enabled || output_config_requested) && thinking_enabled
+}
+
 fn merge_token_limits(target: &mut Option<TokenLimits>, incoming: Option<TokenLimits>) {
     let Some(incoming) = incoming else {
         return;
@@ -802,6 +815,11 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
+    // 客户端显式要求 reasoning（如 Codex 传 reasoning_effort）时，即使全局
+    // extract_thinking 开关关闭，非流式响应也不应把 thinking 部分吞掉。在 payload
+    // 被下面的闭包移走之前先取出这个布尔值。
+    let output_config_requested = payload.output_config.is_some();
+
     // 计量（输入 token 估算 + CacheMeter 查/写）延后到上游返回后再算，避免坐在首字
     // 关键路径上：这两项都是 O(会话长度) 的同步 CPU 工作，随对话轮数线性放大 TTFT，
     // 且结果仅在响应完成后的 trace/用量记账里消费，不参与构建上游请求。
@@ -867,7 +885,8 @@ pub async fn post_messages(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking =
+            effective_extract_thinking(state.extract_thinking, output_config_requested, thinking_enabled);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -967,6 +986,87 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 流式响应的用量 / trace 结算器。
+///
+/// `stream::unfold` 驱动的状态机原本只在"上游读流失败"和"流自然结束"两个分支
+/// 里调用用量记账（`record_stream_usage`）和 trace 收尾（`tracer.finalize`）。
+/// 客户端主动断开连接（Codex 取消请求、超时重连等）时，Axum/Hyper 会直接把
+/// 这个 `stream::unfold` 状态机对应的 future 整体 drop 掉——既不会走 `Err` 分支
+/// 也不会走 `None` 分支，用量/credits 从未 record，trace 也从未 finalize，
+/// 成为悬空记录，admin 面板的用量统计和 trace 日志因此不完整。
+///
+/// 用 `Drop` 兜底：把 `ctx`/`hook`/`credential_id`/`tracer`/`sent_bytes` 收进这个
+/// 结构体、随状态机一起被线程传递，只要流没有走到 [`Self::settle`] 标记的正常
+/// 收尾路径就被 drop，在 `drop` 时按 "interrupted" 补记一次（用 `ctx` 里已累积的
+/// 部分用量，而不是 0），且 `settled` 保证只结算一次，不会和正常路径重复记账。
+struct StreamSettlement {
+    ctx: StreamContext,
+    hook: UsageRecordHook,
+    credential_id: u64,
+    tracer: std::sync::Arc<RequestTracer>,
+    sent_bytes: u64,
+    settled: bool,
+}
+
+impl StreamSettlement {
+    fn new(
+        ctx: StreamContext,
+        hook: UsageRecordHook,
+        credential_id: u64,
+        tracer: std::sync::Arc<RequestTracer>,
+    ) -> Self {
+        Self {
+            ctx,
+            hook,
+            credential_id,
+            tracer,
+            sent_bytes: 0,
+            settled: false,
+        }
+    }
+
+    /// 正常收尾路径（读流失败 / 流自然结束）调用：记账 + trace finalize，并标记
+    /// 已结算，避免这个 settlement 被 drop 时在 [`Drop`] 里重复处理。
+    fn settle(
+        &mut self,
+        status: &str,
+        final_status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        interrupted_after_bytes: Option<u64>,
+    ) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        record_stream_usage(&self.hook, &self.ctx, self.credential_id, status);
+        self.tracer.finalize(
+            final_status,
+            error_type,
+            error_message,
+            interrupted_after_bytes,
+            stream_trace_usage(&self.ctx),
+        );
+    }
+}
+
+impl Drop for StreamSettlement {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        record_stream_usage(&self.hook, &self.ctx, self.credential_id, "error");
+        self.tracer.finalize(
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some("response stream was cancelled before completion"),
+            Some(self.sent_bytes),
+            stream_trace_usage(&self.ctx),
+        );
+    }
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -985,10 +1085,11 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
+    let settlement = StreamSettlement::new(ctx, hook, credential_id, tracer);
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        (body_stream, settlement, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
+        |(mut body_stream, mut settlement, mut decoder, finished, mut ping_interval)| async move {
             if finished {
                 return None;
             }
@@ -999,8 +1100,8 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            tracer.mark_first_token();
-                            sent_bytes += chunk.len() as u64;
+                            settlement.tracer.mark_first_token();
+                            settlement.sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -1011,7 +1112,7 @@ fn create_sse_stream(
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
+                                            let sse_events = settlement.ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
                                     }
@@ -1027,57 +1128,45 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, settlement, decoder, false, ping_interval)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束（记为 error）
-                            let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "error");
+                            // 走错误终止路径（关块 + error，跳过 message_delta/message_stop）：
+                            // 与工具 JSON 半截场景同理，先发"正常收尾"事件会让下游消费方
+                            // （如 Responses/Chat 流式转换层）提前判定流已结束，导致紧随其后
+                            // 的 error 事件被丢弃。
+                            let final_events = settlement.ctx.generate_error_events("api_error", &e.to_string());
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
-                            tracer.finalize(
+                            settlement.settle(
+                                "error",
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
                                 Some(&e.to_string()),
-                                Some(sent_bytes),
-                                stream_trace_usage(&ctx),
+                                Some(settlement.sent_bytes),
                             );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, settlement, decoder, true, ping_interval)))
                         }
                         None => {
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
-                            let final_events = ctx.generate_final_events();
-                            if let Some(message) = ctx.tool_json_error_message() {
+                            let final_events = settlement.ctx.generate_final_events();
+                            if let Some(message) = settlement.ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
-                                record_stream_usage(&hook, &ctx, credential_id, "error");
-                                tracer.finalize(
-                                    "error",
-                                    Some(outcome::BAD_REQUEST),
-                                    Some(&message),
-                                    None,
-                                    stream_trace_usage(&ctx),
-                                );
+                                settlement.settle("error", "error", Some(outcome::BAD_REQUEST), Some(&message), None);
                             } else {
-                                record_stream_usage(&hook, &ctx, credential_id, "success");
-                                tracer.finalize(
-                                    "success",
-                                    None,
-                                    None,
-                                    None,
-                                    stream_trace_usage(&ctx),
-                                );
+                                settlement.settle("success", "success", None, None, None);
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, settlement, decoder, true, ping_interval)))
                         }
                     }
                 }
@@ -1085,7 +1174,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, settlement, decoder, false, ping_interval)))
                 }
             }
         },
@@ -1781,6 +1870,10 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
+    // 客户端显式要求 reasoning 时，即使全局 extract_thinking 开关关闭，非流式响应
+    // 也不应把 thinking 部分吞掉。在 payload 被下面的闭包移走之前先取出这个布尔值。
+    let output_config_requested = payload.output_config.is_some();
+
     // 计量延后到上游返回后再算，避免坐在首字关键路径上（详见 stream_request 同款说明）。
     let compute_metering = {
         let cache_meter = state.cache_meter.clone();
@@ -1837,7 +1930,8 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking =
+            effective_extract_thinking(state.extract_thinking, output_config_requested, thinking_enabled);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -2066,6 +2160,148 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_extract_thinking_respects_global_switch_and_explicit_reasoning_request() {
+        // thinking 本身未启用：无论开关/output_config 怎样都不提取。
+        assert!(!effective_extract_thinking(false, false, false));
+        assert!(!effective_extract_thinking(true, true, false));
+
+        // thinking 已启用 + 全局开关开：提取。
+        assert!(effective_extract_thinking(true, false, true));
+
+        // thinking 已启用 + 全局开关关 + 客户端未显式要 reasoning：不提取（历史行为不变）。
+        assert!(!effective_extract_thinking(false, false, true));
+
+        // thinking 已启用 + 全局开关关 + 客户端显式要 reasoning（output_config）：
+        // 必须提取，不能因为管理员没开全局开关就把 thinking 吞掉。
+        assert!(effective_extract_thinking(false, true, true));
+    }
+
+    #[test]
+    fn dropped_stream_settlement_records_interrupted_exactly_once() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = std::sync::Arc::new(RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "cancelled-stream-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 9,
+            key_source: TraceKeySource::ClientKey,
+            model: "claude-sonnet-4-6".to_string(),
+            is_stream: true,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            stages: parking_lot::Mutex::new(Vec::new()),
+        });
+        tracer.on_attempt(TraceAttempt {
+            attempt: 0,
+            credential_id: 42,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome::SUCCESS.to_string(),
+            error_snippet: None,
+            duration_ms: 5,
+        });
+
+        let ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            10,
+            false,
+            std::collections::HashMap::new(),
+            test_known_tools_for_handlers_tests(),
+        );
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 1,
+            model: "claude-sonnet-4-6".to_string(),
+            started_at: Instant::now(),
+        };
+
+        {
+            let mut settlement = StreamSettlement::new(ctx, hook, 42, tracer.clone());
+            settlement.sent_bytes = 123;
+            // 客户端在这里断开：settlement 没有走 settle()，直接被 drop。
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            model: Some("claude-sonnet-4-6".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "Drop 应且只应补记一条 trace");
+        let record = &records[0];
+        assert_eq!(record.final_status, "interrupted");
+        assert_eq!(record.interrupted_after_bytes, Some(123));
+        assert_eq!(record.final_credential_id, 42);
+    }
+
+    fn test_known_tools_for_handlers_tests() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    #[test]
+    fn settled_stream_settlement_is_not_double_recorded_on_drop() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = std::sync::Arc::new(RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "settled-stream-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 9,
+            key_source: TraceKeySource::ClientKey,
+            model: "claude-sonnet-4-6".to_string(),
+            is_stream: true,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            stages: parking_lot::Mutex::new(Vec::new()),
+        });
+        tracer.on_attempt(TraceAttempt {
+            attempt: 0,
+            credential_id: 7,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome::SUCCESS.to_string(),
+            error_snippet: None,
+            duration_ms: 5,
+        });
+
+        let ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            10,
+            false,
+            std::collections::HashMap::new(),
+            test_known_tools_for_handlers_tests(),
+        );
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 1,
+            model: "claude-sonnet-4-6".to_string(),
+            started_at: Instant::now(),
+        };
+
+        {
+            let mut settlement = StreamSettlement::new(ctx, hook, 7, tracer.clone());
+            settlement.settle("success", "success", None, None, None);
+            // 正常收尾后立即 drop：不应再补记一条 interrupted。
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            model: Some("claude-sonnet-4-6".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "settle() 之后 Drop 不应重复记账");
+        assert_eq!(records[0].final_status, "success");
+    }
 
     #[test]
     fn tracer_renumbers_attempts_across_provider_rounds_before_persisting() {
