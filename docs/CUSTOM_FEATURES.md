@@ -33,20 +33,18 @@
 
 以下 4 类改动**故意搁置未合并**，需要单独开分支评估，合并时先读对应章节：
 
-1. **凭据选择"严格按优先级"重写**（`b0d3926`）：重写了 `acquire_context` 的 priority
-   模式选择逻辑（不再复用 `current_id` 快速路径，改为每次请求重新按 `(priority, id)` 排序
-   选择），同时改了多处 `min_by_key(|e| e.credentials.priority)` 为
-   `(priority, id)` 兜底破同分。这段代码与本仓库 RPM 限流、`least_conn` 负载均衡模式、
-   自愈（self-heal）逻辑深度纠缠（同一批函数），不是可以孤立摘取的小修复，需要人工对照
-   现有 `select_next_credential`/`try_self_heal` 实现评估行为差异后再决定是否采纳。
-2. **自定义模型管理新实现**（`8e54496` 等）：upstream 新增了一套运行时可热更新的模型
-   注册表 + Admin API（`GET/PUT /api/admin/config/custom-models`）+ 设置页「模型」分区，
-   与本仓库既有的"自定义模型映射"（见下文第 5 节，`src/model/custom_models.rs` +
-   `src/admin/model_mapping.rs` + `model-mappings-dialog.tsx`）是同一能力的重复实现。需要
-   评估是否合并为一套，而非并存两个模型别名管理入口。
-3. **代理治理增强**：`7b911c8`（全局代理独立用户名密码）、`8e54496` 中的"专属代理故障
-   自动切换"、`c86ce81`（proxy+model 设置加固），与本仓库代理池（负载策略/自动停用/
-   直连兜底）部分重叠，需要对照评估避免功能重复或行为冲突。
+1. ~~**凭据选择"严格按优先级"重写**（`b0d3926`）~~：**已解决，见下文 Stage A**。原始
+   顾虑（与 RPM 限流/`least_conn`/自愈逻辑深度纠缠）核实后确认可以孤立摘取：Stage A
+   逐行采纳了 `acquire_context` 的核心改动（移除 priority 模式 `current_id` 快速路径、
+   全部排序点加 `(priority, id)` 破平局），唯一分歧（保留 `discovery_rank` 优先于纯
+   priority 排序）是刻意且更优的设计，有回归测试覆盖。
+2. ~~**自定义模型管理新实现**（`8e54496` 等）~~：**已解决，见下文 Stage B**。复核后
+   发现原判断"是同一能力的重复实现"不准确：`custom_models.rs`（Stage B 落地）注册的是
+   完整后端模型定义（会出现在 `/v1/models`），`model_mapping.rs` 只做请求时改名转发
+   （源名不出现在 `/v1/models`）——两者服务不同用途，并存是合理设计，不需要合并。
+3. **代理治理增强**：`7b911c8`（全局代理独立用户名密码，Stage C 已覆盖）、
+   `c86ce81`（proxy+model 设置加固，Stage B/C 已覆盖，见下文）**均已解决**；
+   `8e54496` 中的"专属代理故障自动切换"**已通过 Stage F 采纳**（见下文）。
 4. **凭据元数据 schema + admin-ui 大改版**（约 19 个 commit：`8e8bae0`…`18d694c`，另加
    `c4e2919`/`def8929`/`64af2af`/`482946f` 等控制台改版提交）：upstream 新增了一套面向
    凭据转售场景的元数据体系（`type`/`saleStatus`/`salePrice`），以及配套的凭据卡片重设计、
@@ -61,25 +59,30 @@
    （移植 + 验证成本高），不是内容不重要——如果用户反馈 `/v1/responses` 或 Codex CLI
    连接不稳定，应优先翻这个 commit。
 
-### 2026-09-02 后续：分 5 个 Stage 逐一处理上述搁置项（Stage A-E，均已完成）
+### 2026-09-02 后续：分 Stage 逐一处理上述搁置项（Stage A-F，条目 1-3 均已完成）
 
-上述 4 类搁置改动 + 条目 5 的 `de53acc`，按用户决策拆成 5 个独立分支，每个 Stage
+上述 4 类搁置改动 + 条目 5 的 `de53acc`，按用户决策拆成独立分支，每个 Stage
 一个 feature commit + 一个 `merge: Stage X - ...` 合并提交并入 `master`，而非直接
 采纳 upstream 对应 commit（除非明确说明"采纳"，否则均为本仓库根据同一症状写的
 独立实现，架构与 upstream 不同）：
 
-- **Stage A**（`76ba4a6`，独立实现，未采纳 `b0d3926`）：只修复 priority 模式下
-  `current_id` 陈旧导致高优先级凭据恢复后无法立即回切的 bug，加 `(priority, id)`
-  兜底破同分；保留本仓库原有的 `discovery_rank`/RPM 限流/`least_conn` 设计不变。
-  条目 1 的"是否整体采纳 `acquire_context` 重写"仍未评估，本次只是修了一个独立 bug。
+- **Stage A**（`76ba4a6`，独立实现，未采纳 `b0d3926` 原始 diff 但行为等价）：修复
+  priority 模式下 `current_id` 陈旧导致高优先级凭据恢复后无法立即回切的 bug，加
+  `(priority, id)` 兜底破同分；保留本仓库原有的 `discovery_rank`/RPM 限流/`least_conn`
+  设计不变。2026-09-02 逐行复核确认 Stage A 已是 `b0d3926` 核心逻辑的等价实现，
+  **条目 1 已解决**，唯一分歧（保留 `discovery_rank`）是刻意且更优的设计。
 - **Stage B**（`cb99817`，独立实现）：给本仓库既有的 `src/model/custom_models.rs`
   自定义模型映射加上运行时热更新能力 + Admin API/UI（`custom-models-dialog.tsx`），
-  与既有 `model_mapping.rs`/`model-mappings-dialog.tsx` 互补而非取代，两套模型别名
-  管理入口**仍同时存在**，条目 2 里"是否合并为一套"尚未处理。
+  与既有 `model_mapping.rs`/`model-mappings-dialog.tsx` 并存。2026-09-02 复核确认
+  两者数据结构和用途完全不同（前者注册全新后端模型进 `/v1/models`，后者纯改名转发
+  不出现在 `/v1/models`），**条目 2 已解决**，不是需要合并的重复实现。同一批复核也
+  确认 Stage B 顺带吸收了 `c86ce81` 的自定义模型字段校验（长度/控制字符/数值范围）。
 - **Stage C**（`baa22a1`，独立实现）：给全局代理 Admin API 补上独立用户名/密码支持，
-  含不回显明文密码、成对校验、持久化顺序修正等安全加固；只覆盖条目 3 里"全局代理独立
-  账密"这一小项，"专属代理故障自动切换"等其余点未处理。
-- **Stage D**（`d000d80`）+ **Stage E**（本次）合起来完整覆盖了条目 5：Stage D 修了
+  含不回显明文密码、成对校验、持久化顺序修正等安全加固，覆盖了条目 3 里"全局代理独立
+  账密"（`7b911c8`）。2026-09-02 复核确认同时吸收了 `c86ce81` 里代理相关的加固点
+  （密码不回显、scheme 白名单含 `socks4a`/`socks5h`、持久化顺序），且比 upstream
+  多加了"用户名密码必须成对设置/清除"的更严格校验。
+- **Stage D**（`d000d80`）+ **Stage E**（`33dac6f`）合起来完整覆盖了条目 5：Stage D 修了
   流取消未结算用量/trace（`StreamSettlement`+Drop）、工具 JSON 错误事件顺序错误、
   非流式 reasoning 被全局开关吞掉；Stage E 修了多轮 web_search agentic loop 的流式
   保活（立即发 `message_start` + 25s ping，避免长耗时搜索被客户端判定连接已死）、
@@ -88,6 +91,14 @@
   （体量 2776 行、大部分是 upstream "伪流式改真流式"的架构迁移，与本仓库从起点就是
   真流式的 `src/openai/*` 无关），只挑了确实存在的具体问题逐条对照修复，**条目 5
   可视为已处理完毕**。
+- **Stage F**（`8e54496` 中"专属代理故障自动切换"部分，独立实现）：修复凭据单独填写
+  `proxy_url`（未加入代理池）时专属代理彻底挂掉后没有任何失败反馈的真实缺口——
+  `provider.rs` 的网络错误分支此前对所有凭据一视同仁只退避重试、从不换号。新增
+  `KiroCredentials::has_own_proxy()`，仅当凭据显式配置了非 `direct` 的专属代理时，
+  网络错误才计入 `report_failure_for_request` 失败次数（阈值制，3 次后禁用且
+  `try_self_heal` 会自动复活，不会重现"网络抖动误禁用全部凭据"的旧顾虑）；没有专属
+  代理的凭据行为不变。顺带在 `credential-card.tsx` 加了代理异常红色标记（按 URL 匹配
+  代理池数据，零后端改动，仅覆盖专属代理也被加入代理池的情况）。**条目 3 全部解决**。
 - 条目 4（凭据元数据 schema + admin-ui 大改版）**未安排 Stage、仍完全搁置**：
   业务语义（卖号场景）是否适用本部署尚未确认。
 

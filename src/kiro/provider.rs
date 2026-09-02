@@ -951,6 +951,11 @@ impl KiroProvider {
                         Some(&e.to_string()),
                         attempt_start,
                     );
+                    // 同 call_api_with_retry：专属代理才计入失败次数，见该函数注释。
+                    if ctx.credentials.has_own_proxy() {
+                        self.token_manager
+                            .report_failure_for_request(ctx.id, None, group);
+                    }
                     last_error = Some(e);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -1339,7 +1344,15 @@ impl KiroProvider {
                         attempt_start,
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）。
+                    // 但若该凭据配置了专属代理，上面的 execute_api_request_with_proxy_failover
+                    // 已经把专属代理 + 直连兜底等候选全部试过仍失败——故障根源大概率是这个凭据
+                    // 自己的专属代理挂了，而不是链路瞬态抖动，计入失败次数才能在阈值后换到别的
+                    // 凭据（TooManyFailures 属于自愈机制会自动复活的禁用类型，误伤风险有限）。
+                    if ctx.credentials.has_own_proxy() {
+                        self.token_manager
+                            .report_failure_for_request(ctx.id, model.as_deref(), group);
+                    }
                     last_error = Some(e);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;

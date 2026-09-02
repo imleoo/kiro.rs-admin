@@ -726,6 +726,20 @@ impl KiroCredentials {
         if out.is_empty() { vec![None] } else { out }
     }
 
+    /// 该凭据是否显式配置了专属代理（区别于纯粹继承全局代理，也区别于显式 `direct` 直连）。
+    ///
+    /// 用于网络错误发生时判断"故障根源是否可能是这个凭据自己的专属代理"：只有这种情况下，
+    /// 把网络错误计入失败次数、必要时切换到其它凭据才有意义；纯粹依赖全局代理/直连的凭据
+    /// 网络错误通常是链路瞬态问题，切换凭据无助于解决（见 `provider.rs` 网络错误分支注释）。
+    pub fn has_own_proxy(&self) -> bool {
+        match self.proxy_url.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => ProxyConfig::split_candidates(raw)
+                .iter()
+                .any(|c| ProxyConfig::is_supported_entry(c) && !ProxyConfig::is_direct(c)),
+            _ => false,
+        }
+    }
+
     pub fn canonicalize_auth_method(&mut self) {
         let auth_method = match &self.auth_method {
             Some(m) => m,
@@ -1746,6 +1760,40 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_has_own_proxy_false_when_unset() {
+        let creds = KiroCredentials::default();
+        assert!(!creds.has_own_proxy());
+    }
+
+    #[test]
+    fn test_has_own_proxy_false_when_empty_string() {
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("   ".to_string());
+        assert!(!creds.has_own_proxy());
+    }
+
+    #[test]
+    fn test_has_own_proxy_false_when_direct_only() {
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("direct".to_string());
+        assert!(!creds.has_own_proxy());
+    }
+
+    #[test]
+    fn test_has_own_proxy_true_when_real_url() {
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("socks5://cred:1080".to_string());
+        assert!(creds.has_own_proxy());
+    }
+
+    #[test]
+    fn test_has_own_proxy_true_when_mixed_with_direct_fallback() {
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("direct, http://proxy:3128".to_string());
+        assert!(creds.has_own_proxy());
     }
 
     // ============ 企业 SSO (external_idp) 测试 ============

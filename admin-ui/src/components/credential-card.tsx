@@ -56,8 +56,8 @@ import {
   useResetSuccessCount,
   useClearThrottle,
 } from "@/hooks/use-credentials";
-import { setCredentialOverage } from "@/api/credentials";
-import { useQueryClient } from "@tanstack/react-query";
+import { setCredentialOverage, getProxyPool } from "@/api/credentials";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { EditCredentialDialog } from "@/components/edit-credential-dialog";
@@ -141,12 +141,15 @@ function formatThrottleCountdown(secs: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
-function formatProxyCandidates(raw?: string): string[] {
+function parseProxyCandidates(raw?: string): { raw: string; masked: string }[] {
   return (raw ?? "")
     .split(/[,;\s]+/)
     .map((item) => item.trim())
     .filter(Boolean)
-    .map((item) => (item.toLowerCase() === "direct" ? "direct" : maskProxyUrl(item)));
+    .map((item) => ({
+      raw: item,
+      masked: item.toLowerCase() === "direct" ? "direct" : maskProxyUrl(item),
+    }));
 }
 
 /**
@@ -262,6 +265,18 @@ export function CredentialCard({
   const clearThrottle = useClearThrottle();
   const queryClient = useQueryClient();
   const displayName = credentialDisplayName(credential.email, credential.id, privacyMode);
+
+  // 代理池数据：与 proxy-pool-dialog 共用同一个 queryKey，多张卡片同时挂载时
+  // react-query 会去重成一次网络请求。只有展示代理信息时才需要，避免无谓请求。
+  const { data: proxyPoolData } = useQuery({
+    queryKey: ["proxy-pool"],
+    queryFn: getProxyPool,
+    enabled: !!credential.hasProxy,
+    staleTime: 30_000,
+  });
+  const proxyPoolByUrl = new Map(
+    (proxyPoolData?.proxies ?? []).map((entry) => [entry.url, entry]),
+  );
 
   // 拖拽排序：手柄触发，整卡随拖动位移
   const {
@@ -1101,11 +1116,29 @@ export function CredentialCard({
               <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
                 <dt className="shrink-0 text-muted-foreground">代理</dt>
                 <dd className="flex min-w-0 flex-wrap justify-end gap-1 text-right font-mono text-xs">
-                  {formatProxyCandidates(credential.proxyUrl).map((proxy, index) => (
-                    <span key={`${proxy}-${index}`} className="max-w-full truncate rounded bg-secondary px-1.5 py-0.5">
-                      {proxy}
-                    </span>
-                  ))}
+                  {parseProxyCandidates(credential.proxyUrl).map(({ raw, masked }, index) => {
+                    const poolEntry = proxyPoolByUrl.get(raw);
+                    const isUnhealthy =
+                      !!poolEntry && (poolEntry.health === "unhealthy" || poolEntry.autoDisabled);
+                    return (
+                      <span
+                        key={`${raw}-${index}`}
+                        className={`max-w-full truncate rounded px-1.5 py-0.5 ${
+                          isUnhealthy
+                            ? "bg-red-500/15 text-red-600 dark:text-red-400"
+                            : "bg-secondary"
+                        }`}
+                        title={
+                          isUnhealthy
+                            ? `连续探测失败 ${poolEntry!.consecutiveFailures} 次${poolEntry!.autoDisabled ? "，已被健康检查自动禁用" : ""}`
+                            : undefined
+                        }
+                      >
+                        {masked}
+                        {isUnhealthy && ` ⚠${poolEntry!.consecutiveFailures}`}
+                      </span>
+                    );
+                  })}
                 </dd>
               </div>
             )}
