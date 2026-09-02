@@ -33,6 +33,8 @@ import type {
   CompleteSocialLoginRequest,
   GlobalProxyResponse,
   SetGlobalProxyRequest,
+  CustomModelsResponse,
+  SetCustomModelsRequest,
   UpdateConfigResponse,
   SetUpdateConfigRequest,
   ImageUpdateResponse,
@@ -627,6 +629,18 @@ export async function getGlobalProxy(): Promise<GlobalProxyResponse> {
 // 设置全局代理配置
 export async function setGlobalProxy(req: SetGlobalProxyRequest): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>('/config/global-proxy', req)
+  return data
+}
+
+// 获取自定义模型列表
+export async function getCustomModels(): Promise<CustomModelsResponse> {
+  const { data } = await api.get<CustomModelsResponse>('/config/custom-models')
+  return data
+}
+
+// 整表替换自定义模型列表
+export async function setCustomModels(req: SetCustomModelsRequest): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/config/custom-models', req)
   return data
 }
 

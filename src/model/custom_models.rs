@@ -1,14 +1,13 @@
 //! 自定义模型全局注册表
 //!
-//! 启动时由 [`init`] 从 `config.custom_models` 装载一次，运行期只读。仿
-//! `crate::token` / `crate::kiro::machine_id` 的 `OnceLock` 惯例，避免把配置表
-//! 逐层透传进 `map_model` / `get_context_window_size` 等无状态自由函数。
+//! 由 [`init`] 从 `config.custom_models` 装载，支持通过 Admin API 运行时热替换
+//! （见 `src/admin/service.rs` 的 `set_custom_models`），改动无需重启进程即可生效。
 //!
 //! 匹配规则：按模型 `id` 大小写不敏感精确匹配；找不到时自动剥离 `-thinking`
 //! 后缀再试一次（与内置 `map_model` 对 thinking 变体的处理保持一致）。
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use super::config::CustomModel;
 
@@ -20,18 +19,20 @@ struct CustomModelRegistry {
     by_id: HashMap<String, usize>,
 }
 
-static REGISTRY: OnceLock<CustomModelRegistry> = OnceLock::new();
+static REGISTRY: RwLock<Option<CustomModelRegistry>> = RwLock::new(None);
 
-/// 初始化自定义模型注册表。
+/// 初始化 / 热替换自定义模型注册表。
 ///
-/// 应在应用启动时调用一次；重复调用会被忽略（`OnceLock` 语义）。后一条同名 id
-/// 覆盖前一条的索引，但两者都保留在 `ordered` 中（`/v1/models` 会同时展示）。
+/// 可重复调用：每次调用整体替换注册表内容（进程启动时装载一次，Admin API 保存
+/// 成功后再次调用即可热生效）。后一条同名 id 覆盖前一条的索引，但两者都保留在
+/// `ordered` 中（`/v1/models` 会同时展示）。
 pub fn init(models: Vec<CustomModel>) {
     let mut by_id = HashMap::with_capacity(models.len());
     for (idx, m) in models.iter().enumerate() {
         by_id.insert(m.id.to_ascii_lowercase(), idx);
     }
-    let _ = REGISTRY.set(CustomModelRegistry {
+    let mut guard = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(CustomModelRegistry {
         ordered: models,
         by_id,
     });
@@ -40,26 +41,29 @@ pub fn init(models: Vec<CustomModel>) {
 /// 按模型名查找自定义模型定义。
 ///
 /// 先按大小写不敏感精确匹配；未命中且名字带 `-thinking` 后缀时，剥离后再试一次。
-pub fn lookup(model: &str) -> Option<&'static CustomModel> {
-    let reg = REGISTRY.get()?;
+pub fn lookup(model: &str) -> Option<CustomModel> {
+    let guard = REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    let reg = guard.as_ref()?;
     let key = model.to_ascii_lowercase();
     if let Some(&idx) = reg.by_id.get(&key) {
-        return reg.ordered.get(idx);
+        return reg.ordered.get(idx).cloned();
     }
     if let Some(stripped) = key.strip_suffix("-thinking") {
         if let Some(&idx) = reg.by_id.get(stripped) {
-            return reg.ordered.get(idx);
+            return reg.ordered.get(idx).cloned();
         }
     }
     None
 }
 
 /// 返回所有已注册的自定义模型（保持配置文件中的原始顺序）。
-pub fn all() -> &'static [CustomModel] {
+pub fn all() -> Vec<CustomModel> {
     REGISTRY
-        .get()
-        .map(|r| r.ordered.as_slice())
-        .unwrap_or(&[])
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|r| r.ordered.clone())
+        .unwrap_or_default()
 }
 
 /// 是否存在 `backend_id` 等于给定值且声明支持 reasoning 的自定义模型。

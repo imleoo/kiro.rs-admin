@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle, Boxes, HeartPulse, HeartCrack,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle, Boxes, Blocks, HeartPulse, HeartCrack,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -31,6 +31,7 @@ import {
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { ModelMappingsDialog } from '@/components/model-mappings-dialog'
+import { CustomModelsDialog } from '@/components/custom-models-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 
 /**
@@ -55,6 +56,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [modelMappingsOpen, setModelMappingsOpen] = useState(false)
+  const [customModelsOpen, setCustomModelsOpen] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
@@ -128,6 +130,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
     openModelMappings: () => setModelMappingsOpen(true),
+    openCustomModels: () => setCustomModelsOpen(true),
     openModels: () => setModelsDialogOpen(true),
     openKeyDialog,
     retryPolicy,
@@ -154,6 +157,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <ModelMappingsDialog open={modelMappingsOpen} onOpenChange={setModelMappingsOpen} />
+      <CustomModelsDialog open={customModelsOpen} onOpenChange={setCustomModelsOpen} />
       <AvailableModelsDialog
         open={modelsDialogOpen}
         onOpenChange={setModelsDialogOpen}
@@ -266,6 +270,7 @@ interface ToolControls {
   loadBalancingMode?: LoadBalancingMode
   openImageUpdate: () => void
   openModelMappings: () => void
+  openCustomModels: () => void
   openKeyDialog: () => void
   retryPolicy?: RetryPolicyConfig
   setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) => void
@@ -294,6 +299,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
       <KeySettingsMenu
         onOpenKeyDialog={controls.openKeyDialog}
         onOpenModelMappings={controls.openModelMappings}
+        onOpenCustomModels={controls.openCustomModels}
       />
     </>
   )
@@ -344,6 +350,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuLabel>模型</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openModelMappings}>
           <Shuffle />模型映射（请求时模型名转发）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openCustomModels}>
+          <Blocks />自定义模型（新增/覆盖后端模型定义）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -682,9 +691,11 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
 function KeySettingsMenu({
   onOpenKeyDialog,
   onOpenModelMappings,
+  onOpenCustomModels,
 }: {
   onOpenKeyDialog: () => void
   onOpenModelMappings: () => void
+  onOpenCustomModels: () => void
 }) {
   return (
     <DropdownMenu>
@@ -697,6 +708,9 @@ function KeySettingsMenu({
         <DropdownMenuLabel>模型</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenModelMappings}>
           <Shuffle />模型映射（请求时模型名转发）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onOpenCustomModels}>
+          <Blocks />自定义模型（新增/覆盖后端模型定义）
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenKeyDialog}>

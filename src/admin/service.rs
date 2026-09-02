@@ -86,6 +86,103 @@ fn normalize_proxy_list(raw: &str) -> Result<Option<String>, AdminServiceError> 
     Ok(Some(candidates.join("\n")))
 }
 
+/// 自定义模型 id/backendId 的最大长度（字符数）
+const CUSTOM_MODEL_ID_MAX_LEN: usize = 128;
+/// 自定义模型 displayName/ownedBy 的最大长度（字符数）
+const CUSTOM_MODEL_TEXT_MAX_LEN: usize = 256;
+/// 自定义模型 contextWindow 的合法范围
+const CUSTOM_MODEL_CONTEXT_WINDOW_RANGE: std::ops::RangeInclusive<i32> = 1..=10_000_000;
+/// 自定义模型 maxTokens 的合法范围
+const CUSTOM_MODEL_MAX_TOKENS_RANGE: std::ops::RangeInclusive<i32> = 1..=1_000_000;
+
+/// 校验整表自定义模型列表，通过则原样返回（不改写内容）。
+///
+/// 注意：**允许同名 id 重复**——`custom_models` 注册表本身就设计为"后一条覆盖前一条
+/// 的查询索引，但两者都保留在展示列表中"（见 `src/model/custom_models.rs` 文档注释），
+/// 这里不做去重校验，避免破坏该既有设计。
+fn validate_custom_models(
+    models: Vec<crate::model::config::CustomModel>,
+) -> Result<Vec<crate::model::config::CustomModel>, AdminServiceError> {
+    for m in &models {
+        validate_custom_model_required_field("id", &m.id, CUSTOM_MODEL_ID_MAX_LEN)?;
+        validate_custom_model_required_field("backendId", &m.backend_id, CUSTOM_MODEL_ID_MAX_LEN)?;
+        if let Some(v) = &m.display_name {
+            validate_custom_model_optional_field("displayName", v, CUSTOM_MODEL_TEXT_MAX_LEN)?;
+        }
+        if let Some(v) = &m.owned_by {
+            validate_custom_model_optional_field("ownedBy", v, CUSTOM_MODEL_TEXT_MAX_LEN)?;
+        }
+        if let Some(window) = m.context_window {
+            if !CUSTOM_MODEL_CONTEXT_WINDOW_RANGE.contains(&window) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "自定义模型 \"{}\" 的 contextWindow 超出合法范围（{}~{}）: {}",
+                    m.id,
+                    CUSTOM_MODEL_CONTEXT_WINDOW_RANGE.start(),
+                    CUSTOM_MODEL_CONTEXT_WINDOW_RANGE.end(),
+                    window
+                )));
+            }
+        }
+        if let Some(max_tokens) = m.max_tokens {
+            if !CUSTOM_MODEL_MAX_TOKENS_RANGE.contains(&max_tokens) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "自定义模型 \"{}\" 的 maxTokens 超出合法范围（{}~{}）: {}",
+                    m.id,
+                    CUSTOM_MODEL_MAX_TOKENS_RANGE.start(),
+                    CUSTOM_MODEL_MAX_TOKENS_RANGE.end(),
+                    max_tokens
+                )));
+            }
+        }
+    }
+    Ok(models)
+}
+
+fn validate_custom_model_required_field(
+    field: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), AdminServiceError> {
+    if value.trim().is_empty() {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "自定义模型字段 {} 不能为空",
+            field
+        )));
+    }
+    validate_custom_model_text_common(field, value, max_len)
+}
+
+fn validate_custom_model_optional_field(
+    field: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), AdminServiceError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_custom_model_text_common(field, value, max_len)
+}
+
+fn validate_custom_model_text_common(
+    field: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), AdminServiceError> {
+    if value.chars().count() > max_len {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "自定义模型字段 {} 超出长度限制（{} 字符）",
+            field, max_len
+        )));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "自定义模型字段 {} 不能包含控制字符",
+            field
+        )));
+    }
+    Ok(())
+}
+
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
@@ -1648,6 +1745,28 @@ impl AdminService {
         // 从磁盘加载最新 config 再写，避免覆盖其他字段的并发修改
         let url_for_save = normalized;
         self.update_config_file(move |c| c.proxy_url = url_for_save);
+        Ok(())
+    }
+
+    /// 获取当前自定义模型列表（保持配置文件中的原始顺序）
+    pub fn get_custom_models(&self) -> Vec<crate::model::config::CustomModel> {
+        crate::model::custom_models::all()
+    }
+
+    /// 整表替换自定义模型列表：校验 → 持久化到配置文件 → 热替换运行时注册表。
+    ///
+    /// 持久化失败会直接上抛（不像旧 `update_config_file` 那样只记 warn 静默吞掉），
+    /// 避免前端误以为保存成功、实际配置文件未落盘的情况。
+    pub fn set_custom_models(
+        &self,
+        models: Vec<crate::model::config::CustomModel>,
+    ) -> Result<(), AdminServiceError> {
+        let validated = validate_custom_models(models)?;
+        let for_save = validated.clone();
+        self.token_manager
+            .update_config_file(move |c| c.custom_models = for_save)
+            .map_err(|e| AdminServiceError::InternalError(format!("保存自定义模型配置失败: {}", e)))?;
+        crate::model::custom_models::init(validated);
         Ok(())
     }
 
@@ -3896,6 +4015,63 @@ mod tests {
         assert!(validate_model_id("auto").is_err());
         assert!(validate_model_id("AUTO").is_err());
         assert!(validate_model_id(&"x".repeat(257)).is_err());
+    }
+
+    fn sample_custom_model(id: &str) -> crate::model::config::CustomModel {
+        crate::model::config::CustomModel {
+            id: id.to_string(),
+            backend_id: "claude-opus-4.8".to_string(),
+            display_name: None,
+            context_window: None,
+            max_tokens: None,
+            supports_reasoning: None,
+            owned_by: None,
+        }
+    }
+
+    #[test]
+    fn validate_custom_models_accepts_well_formed_entries() {
+        let mut model = sample_custom_model("my-opus");
+        model.display_name = Some("My Opus".to_string());
+        model.context_window = Some(200_000);
+        model.max_tokens = Some(64_000);
+        model.owned_by = Some("custom".to_string());
+        assert!(validate_custom_models(vec![model]).is_ok());
+    }
+
+    #[test]
+    fn validate_custom_models_allows_duplicate_ids() {
+        // 与 custom_models 注册表"后一条覆盖前一条查询索引，两者都保留展示"的既有
+        // 设计一致，不做去重校验。
+        let models = vec![sample_custom_model("dup"), sample_custom_model("dup")];
+        assert!(validate_custom_models(models).is_ok());
+    }
+
+    #[test]
+    fn validate_custom_models_rejects_empty_or_oversized_required_fields() {
+        let empty_id = sample_custom_model("   ");
+        assert!(validate_custom_models(vec![empty_id]).is_err());
+
+        let too_long = sample_custom_model(&"x".repeat(CUSTOM_MODEL_ID_MAX_LEN + 1));
+        assert!(validate_custom_models(vec![too_long]).is_err());
+    }
+
+    #[test]
+    fn validate_custom_models_rejects_control_characters() {
+        let mut model = sample_custom_model("has-control");
+        model.display_name = Some("bad\u{0007}name".to_string());
+        assert!(validate_custom_models(vec![model]).is_err());
+    }
+
+    #[test]
+    fn validate_custom_models_rejects_out_of_range_numeric_fields() {
+        let mut bad_window = sample_custom_model("bad-window");
+        bad_window.context_window = Some(0);
+        assert!(validate_custom_models(vec![bad_window]).is_err());
+
+        let mut bad_max_tokens = sample_custom_model("bad-max-tokens");
+        bad_max_tokens.max_tokens = Some(10_000_000);
+        assert!(validate_custom_models(vec![bad_max_tokens]).is_err());
     }
 
     #[tokio::test]
