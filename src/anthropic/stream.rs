@@ -1352,6 +1352,50 @@ impl SseStateManager {
 
         events
     }
+
+    /// 生成错误终止事件序列：关闭所有未关闭的内容块、直接发 `error` 事件，
+    /// **跳过** message_delta / message_stop。
+    ///
+    /// 用于上游读流失败 / 工具调用 JSON 半截等场景：如果先按 [`Self::generate_final_events`]
+    /// 那样发出正常收尾的 message_delta + message_stop，再追加 error，下游消费方（例如
+    /// `src/openai/handlers.rs` 的 Responses/Chat 流式转换层）看到 message_stop 就会
+    /// 提前把流标记为已结束，随后姗姗来迟的 error 事件会被直接丢弃——客户端因此拿到一个
+    /// "看起来正常完成"的响应，而实际上工具调用参数是半截的。
+    pub fn generate_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        // 关闭所有未关闭的块（与 generate_final_events 一致）。
+        for (index, block) in self.active_blocks.iter_mut() {
+            if block.started && !block.stopped {
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    }),
+                ));
+                block.stopped = true;
+            }
+        }
+
+        // 标记为已终止，防止后续误调用 generate_final_events 再补发一轮
+        // message_delta/message_stop。
+        self.message_delta_sent = true;
+        self.message_ended = true;
+
+        events.push(SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message
+                }
+            }),
+        ));
+
+        events
+    }
 }
 
 use super::converter::get_context_window_size;
@@ -2545,6 +2589,19 @@ impl StreamContext {
             }
         }
 
+        // 工具调用 JSON 半截 / 非法：直接进入错误终止路径（关块 + error），跳过正常的
+        // message_delta / message_stop。上游读流失败分支（create_sse_stream）里已经
+        // 对着同一问题绕了个圈子先发"正常收尾"再补 error，下游消费方（如
+        // src/openai/handlers.rs 的 Responses/Chat 流式转换层）看到 message_stop 就会
+        // 提前判定流已结束，姗姗来迟的 error 事件因此被直接丢弃——客户端拿到一个
+        // "看起来正常完成"的响应，但工具调用参数其实是半截的。
+        if let Some(err) = &self.tool_json_error {
+            let error_type = err.error_type();
+            let message = err.message();
+            events.extend(self.generate_error_events(error_type, &message));
+            return events;
+        }
+
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
         let final_output_tokens = self.resolved_output_tokens();
@@ -2558,21 +2615,18 @@ impl StreamContext {
             self.metering.as_ref(),
         ));
 
-        // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
-        // 客户端本次工具调用因上游半截 / 非法 JSON 未被转发（实时流已返回 200，无法再改状态码）。
-        if let Some(err) = &self.tool_json_error {
-            events.push(SseEvent::new(
-                "error",
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": err.error_type(),
-                        "message": err.message()
-                    }
-                }),
-            ));
-        }
+        events
+    }
 
+    /// 生成错误终止事件序列：先关闭未 flush 的 thinking 块（若有），再委托给
+    /// [`SseStateManager::generate_error_events`] 关闭其余内容块并发出 `error` 事件，
+    /// **不**发送 message_delta / message_stop。
+    ///
+    /// 供两处场景复用：(1) 本函数检测到工具调用 JSON 半截/非法时；(2)
+    /// `create_sse_stream` 里上游读流失败时。
+    pub fn generate_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        let mut events = self.close_open_thinking_block();
+        events.extend(self.state_manager.generate_error_events(error_type, message));
         events
     }
 }
@@ -5408,5 +5462,110 @@ mod tests {
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
+    }
+
+    #[test]
+    fn incomplete_tool_json_ends_stream_with_error_only() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+        // 初始文本块（index 0）应处于打开状态，尚未被 stop。
+
+        // 非法 JSON：process_tool_use 立刻把错误记到 self.tool_json_error，
+        // 不会为这次失败的工具调用注册任何新块。
+        all_events.extend(ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "read_file".to_string(),
+            tool_use_id: "toolu_bad".to_string(),
+            input: "{not json".to_string(),
+            stop: true,
+        })));
+
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(
+            !all_events.iter().any(|e| e.event == "message_delta"),
+            "工具 JSON 出错时不应发送 message_delta: {:?}",
+            all_events
+        );
+        assert!(
+            !all_events.iter().any(|e| e.event == "message_stop"),
+            "工具 JSON 出错时不应发送 message_stop: {:?}",
+            all_events
+        );
+        // 初始文本块必须被关闭，不能因为进入错误路径就漏关块。
+        assert!(
+            all_events
+                .iter()
+                .any(|e| e.event == "content_block_stop" && e.data["index"] == json!(0)),
+            "应关闭仍打开的初始文本块: {:?}",
+            all_events
+        );
+        let last = all_events.last().expect("应至少有一个事件");
+        assert_eq!(last.event, "error", "最后一个事件必须是 error: {:?}", all_events);
+        assert_eq!(last.data["error"]["type"], "upstream_tool_json_error");
+    }
+
+    #[test]
+    fn error_termination_closes_open_thinking_block_before_error() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+
+        // 打开一个 thinking 块并写入一些内容，此时尚未收到 </thinking> 结束标签。
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("thinking about it".to_string()),
+                signature: Some("sig".to_string()),
+                redacted_content: None,
+            },
+        )));
+        let thinking_index = ctx
+            .thinking_block_index
+            .expect("thinking 块应已打开");
+
+        // 紧接着来一个非法 JSON 的工具调用，触发错误终止路径。
+        all_events.extend(ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "read_file".to_string(),
+            tool_use_id: "toolu_bad".to_string(),
+            input: "{not json".to_string(),
+            stop: true,
+        })));
+
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(!all_events.iter().any(|e| e.event == "message_delta"));
+        assert!(!all_events.iter().any(|e| e.event == "message_stop"));
+
+        // thinking 块必须在 error 之前被正确关闭（content_block_stop 出现在 error 之前）。
+        let stop_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_stop" && e.data["index"] == json!(thinking_index)
+            })
+            .expect("thinking 块应被关闭");
+        let error_pos = all_events
+            .iter()
+            .position(|e| e.event == "error")
+            .expect("应发出 error 事件");
+        assert!(
+            stop_pos < error_pos,
+            "thinking 块必须在 error 事件之前关闭: {:?}",
+            all_events
+        );
+        assert_eq!(all_events.last().unwrap().event, "error");
     }
 }
