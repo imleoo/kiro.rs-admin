@@ -23,7 +23,7 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, CredentialResponseTestRequest, CustomModelsResponse,
-        GlobalProxyResponse, ModelTestRequest, ProxyCheckUrlRequest,
+        ModelTestRequest, ProxyCheckUrlRequest,
         SetAccountThrottleConfigRequest, SetCustomModelsRequest, SetDisabledRequest,
         SetGlobalProxyRequest, SetLoadBalancingModeRequest,
         SetLogGovernanceConfigRequest, SetPriorityRequest, SetProxyBalancingModeRequest,
@@ -753,21 +753,19 @@ pub async fn complete_social_login(
 }
 
 /// GET /api/admin/config/global-proxy
-/// 获取当前全局代理配置
+/// 获取当前全局代理配置（不回显明文密码）
 pub async fn get_global_proxy(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(GlobalProxyResponse {
-        proxy_url: state.service.get_global_proxy(),
-    })
+    Json(state.service.get_global_proxy())
 }
 
 /// PUT /api/admin/config/global-proxy
-/// 设置或清除全局代理配置
+/// 设置或清除全局代理配置（URL + 可选认证账密）
 pub async fn set_global_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<SetGlobalProxyRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_global_proxy(payload.proxy_url) {
-        Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
+    match state.service.set_global_proxy(payload) {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

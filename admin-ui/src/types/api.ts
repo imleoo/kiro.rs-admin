@@ -281,10 +281,17 @@ export interface AssignRoundRobinResponse {
 // 全局代理配置
 export interface GlobalProxyResponse {
   proxyUrl: string | null
+  proxyUsername: string | null
+  /** 是否已配置认证密码——不回显明文，仅告知是否已设置 */
+  proxyPasswordSet: boolean
 }
 
 export interface SetGlobalProxyRequest {
+  /** null 清除整个全局代理（含账密） */
   proxyUrl: string | null
+  /** 缺省=不改，空字符串=清除，非空=设置。用户名密码必须成对设置或成对清除 */
+  proxyUsername?: string
+  proxyPassword?: string
 }
 
 // 在线更新配置

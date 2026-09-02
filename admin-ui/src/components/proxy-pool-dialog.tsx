@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   XCircle,
   HelpCircle,
+  Lock,
 } from 'lucide-react'
 import {
   Dialog,
@@ -40,7 +41,7 @@ import {
   type ProxyBalancingMode,
 } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
-import type { ProxyPoolEntry } from '@/types/api'
+import type { ProxyPoolEntry, SetGlobalProxyRequest } from '@/types/api'
 
 interface ProxyPoolDialogProps {
   open: boolean
@@ -82,6 +83,9 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set())
   const [checkingIds, setCheckingIds] = useState<Set<number>>(() => new Set())
   const [batchAction, setBatchAction] = useState<BatchAction>(null)
+  const [authFormOpen, setAuthFormOpen] = useState(false)
+  const [authUsername, setAuthUsername] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
   const queryClient = useQueryClient()
 
   const { data, isLoading } = useQuery({
@@ -112,10 +116,10 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   })
 
   const setGlobalProxyMutation = useMutation({
-    mutationFn: (url: string | null) => setGlobalProxy({ proxyUrl: url }),
-    onSuccess: (_, url) => {
-      const count = url ? splitProxyCandidates(url).length : 0
-      toast.success(url ? `已设置 ${count} 个全局代理候选` : '已清除全局代理')
+    mutationFn: (req: SetGlobalProxyRequest) => setGlobalProxy(req),
+    onSuccess: (_, req) => {
+      const count = req.proxyUrl ? splitProxyCandidates(req.proxyUrl).length : 0
+      toast.success(req.proxyUrl ? `已设置 ${count} 个全局代理候选` : '已清除全局代理')
       queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
     },
     onError: (err) => toast.error(`操作失败: ${extractErrorMessage(err)}`),
@@ -188,7 +192,8 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
 
   const saveGlobalCandidates = (candidates: string[]) => {
     const next = normalizeProxyCandidates(candidates)
-    return setGlobalProxyMutation.mutateAsync(next.length > 0 ? next.join('\n') : null)
+    // 不携带 proxyUsername/proxyPassword：后端按"字段缺失=不改"语义保留现有认证信息。
+    return setGlobalProxyMutation.mutateAsync({ proxyUrl: next.length > 0 ? next.join('\n') : null })
   }
 
   const toggleSelected = (id: number, checked: boolean) => {
@@ -210,6 +215,48 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
         ? [...globalProxyCandidates, proxy.url]
         : globalProxyCandidates.filter((candidate) => candidate !== proxy.url)
       await saveGlobalCandidates(next)
+    } catch {
+      // setGlobalProxyMutation already shows the toast.
+    }
+  }
+
+  const openAuthForm = () => {
+    setAuthUsername(globalProxyData?.proxyUsername ?? '')
+    setAuthPassword('')
+    setAuthFormOpen(true)
+  }
+
+  const handleSaveAuth = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const username = authUsername.trim()
+    const password = authPassword
+    if (!username || !password) {
+      toast.error('用户名和密码必须同时填写；如需清除认证，用下方「清除认证」按钮')
+      return
+    }
+    try {
+      await setGlobalProxyMutation.mutateAsync({
+        proxyUrl: currentGlobalProxy,
+        proxyUsername: username,
+        proxyPassword: password,
+      })
+      setAuthFormOpen(false)
+      setAuthPassword('')
+    } catch {
+      // setGlobalProxyMutation already shows the toast.
+    }
+  }
+
+  const handleClearAuth = async () => {
+    try {
+      await setGlobalProxyMutation.mutateAsync({
+        proxyUrl: currentGlobalProxy,
+        proxyUsername: '',
+        proxyPassword: '',
+      })
+      setAuthFormOpen(false)
+      setAuthUsername('')
+      setAuthPassword('')
     } catch {
       // setGlobalProxyMutation already shows the toast.
     }
@@ -532,6 +579,18 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       />
                       直连兜底
                     </label>
+                    {currentGlobalProxy && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs"
+                        onClick={() => (authFormOpen ? setAuthFormOpen(false) : openAuthForm())}
+                        title="全局代理认证账密（适用于所有全局代理候选）"
+                      >
+                        <Lock className="h-3 w-3 mr-1" />
+                        认证{globalProxyData?.proxyPasswordSet ? `（${globalProxyData.proxyUsername ?? ''}）` : ''}
+                      </Button>
+                    )}
                     <Button
                       size="sm"
                       variant="outline"
@@ -597,6 +656,60 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                   </div>
                 )}
               </div>
+              {authFormOpen && (
+                <form
+                  onSubmit={handleSaveAuth}
+                  className="flex flex-wrap items-end gap-2 rounded-md border border-border/60 bg-secondary/30 p-2"
+                >
+                  <label className="text-xs font-medium text-muted-foreground">
+                    代理认证用户名
+                    <Input
+                      value={authUsername}
+                      onChange={(e) => setAuthUsername(e.target.value)}
+                      disabled={setGlobalProxyMutation.isPending}
+                      className="mt-1 h-8 w-40 text-[13px]"
+                    />
+                  </label>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    密码
+                    <Input
+                      type="password"
+                      value={authPassword}
+                      onChange={(e) => setAuthPassword(e.target.value)}
+                      placeholder={globalProxyData?.proxyPasswordSet ? '已设置，留空则不修改' : ''}
+                      disabled={setGlobalProxyMutation.isPending}
+                      className="mt-1 h-8 w-40 text-[13px]"
+                    />
+                  </label>
+                  <Button type="submit" size="sm" className="h-8 text-xs" disabled={setGlobalProxyMutation.isPending}>
+                    保存
+                  </Button>
+                  {globalProxyData?.proxyPasswordSet && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-8 text-xs text-muted-foreground hover:text-destructive"
+                      onClick={handleClearAuth}
+                      disabled={setGlobalProxyMutation.isPending}
+                    >
+                      清除认证
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 text-xs"
+                    onClick={() => setAuthFormOpen(false)}
+                  >
+                    取消
+                  </Button>
+                  <span className="w-full text-xs text-muted-foreground">
+                    对所有全局代理候选生效（用户名密码必须同时填写或同时清除）。
+                  </span>
+                </form>
+              )}
               {orphanGlobalCandidates.length > 0 && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-700 dark:text-yellow-300">
                   <span>有 {orphanGlobalCandidates.length} 个旧全局代理还不在代理池里。</span>

@@ -63,7 +63,9 @@ impl ProxyConfig {
             || value.starts_with("http://")
             || value.starts_with("https://")
             || value.starts_with("socks5://")
+            || value.starts_with("socks5h://")
             || value.starts_with("socks4://")
+            || value.starts_with("socks4a://")
     }
 
     pub fn from_url_with_auth(
