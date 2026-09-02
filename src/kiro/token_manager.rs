@@ -1633,7 +1633,7 @@ impl MultiTokenManager {
         let initial_id = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
             .map(|e| e.id)
             .unwrap_or(0);
 
@@ -2104,10 +2104,10 @@ impl MultiTokenManager {
         match mode {
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // 平局时按优先级排序（数字越小优先级越高），再平按 ID 升序保证确定性。
                 let (entry, _) = available.iter().min_by_key(|(e, support)| {
                     let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.success_count, e.credentials.priority)
+                    (discovery_rank, e.success_count, e.credentials.priority, e.id)
                 })?;
 
                 Some((entry.id, entry.credentials.clone()))
@@ -2115,19 +2115,27 @@ impl MultiTokenManager {
             "least_conn" => {
                 // Least-Connections 策略：选择当前在途请求数最少的凭据。
                 // 直接反映瞬时压力，天然避免惊群与「反复选中→反复 429」死循环。
-                // 平局按优先级（数字小者优先），再平按累计成功数（在空闲均势下更均衡）。
+                // 平局按优先级（数字小者优先），再平按累计成功数，最后按 ID 升序保证确定性。
                 let (entry, _) = available.iter().min_by_key(|(e, support)| {
                     let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.in_flight, e.credentials.priority, e.success_count)
+                    (
+                        discovery_rank,
+                        e.in_flight,
+                        e.credentials.priority,
+                        e.success_count,
+                        e.id,
+                    )
                 })?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
+                // priority 模式（默认）：模型发现状态优先于优先级（已确认支持的低优先级
+                // 凭据优先于支持状态未知的高优先级凭据），再按优先级，最后按 ID 升序
+                // 保证同优先级下的确定性顺序。
                 let (entry, _) = available.iter().min_by_key(|(e, support)| {
                     let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.credentials.priority)
+                    (discovery_rank, e.credentials.priority, e.id)
                 })?;
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -2212,71 +2220,33 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, is_balanced) = {
-                // priority 模式固定 current_id；balanced / least_conn 每次重新选择
                 let mode_snapshot = self.load_balancing_mode.lock().clone();
-                let re_select_each_request = mode_snapshot != "priority";
                 let is_balanced = mode_snapshot == "balanced";
 
-                // 非 priority 模式：每次请求都重新选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if re_select_each_request {
-                    None
+                // 所有模式都按当前请求重新选择，不复用 current_id：priority 模式如果
+                // 固定复用 current_id，会在高优先级凭据从 RPM/冷却恢复后无法在下一次
+                // 请求立即切回，必须一直等到当前低优先级凭据自己也失效为止。
+                let mut best = self.select_next_credential_excluding(model, group, excluded_ids);
+
+                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
+                // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
+                if best.is_none() && self.try_self_heal(model, group) {
+                    best = self.select_next_credential_excluding(model, group, excluded_ids);
+                }
+
+                let (id, credentials) = if let Some((new_id, new_creds)) = best {
+                    if update_current {
+                        let mut current_id = self.current_id.lock();
+                        *current_id = new_id;
+                    }
+                    (new_id, new_creds)
                 } else {
                     let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    let now = Instant::now();
-                    let confirmed_available = entries.iter().any(|e| {
-                        !e.disabled
-                            && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                            && credential_matches_request(&e.credentials, model, group)
-                            && self.cached_model_support(e.id, model)
-                                == CachedModelSupport::Confirmed
-                    });
-                    entries
-                        .iter()
-                        .find(|e| {
-                            let model_support = self.cached_model_support(e.id, model);
-                            e.id == current_id
-                                && !excluded_ids.contains(&e.id)
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
-                                && !is_rpm_exceeded(e, now)
-                                && credential_matches_request(&e.credentials, model, group)
-                                && model_support != CachedModelSupport::Unsupported
-                                && (!confirmed_available
-                                    || model_support == CachedModelSupport::Confirmed)
-                        })
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                let (id, credentials) = if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best =
-                        self.select_next_credential_excluding(model, group, excluded_ids);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
-                    // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
-                    if best.is_none() && self.try_self_heal(model, group) {
-                        best = self.select_next_credential_excluding(model, group, excluded_ids);
-                    }
-
-                    if let Some((new_id, new_creds)) = best {
-                        if update_current {
-                            let mut current_id = self.current_id.lock();
-                            *current_id = new_id;
-                        }
-                        (new_id, new_creds)
-                    } else {
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
-                    }
+                    // 注意：必须在 bail! 之前计算 available_count，
+                    // 因为 available_count() 会尝试获取 entries 锁，
+                    // 而此时我们已经持有该锁，会导致死锁
+                    let available = entries.iter().filter(|e| !e.disabled).count();
+                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                 };
 
                 (id, credentials, is_balanced)
@@ -2361,7 +2331,7 @@ impl MultiTokenManager {
         if let Some(best) = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             if best.id != *current_id {
                 tracing::info!(
@@ -2894,7 +2864,7 @@ impl MultiTokenManager {
                     .filter(|entry| {
                         self.entry_available_for_request(entry, model, group, Instant::now())
                     })
-                    .min_by_key(|e| e.credentials.priority)
+                    .min_by_key(|e| (e.credentials.priority, e.id))
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -2969,7 +2939,7 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3137,7 +3107,7 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3203,7 +3173,7 @@ impl MultiTokenManager {
                 let has_available = if let Some(next) = entries
                     .iter()
                     .filter(|e| !e.disabled)
-                    .min_by_key(|e| e.credentials.priority)
+                    .min_by_key(|e| (e.credentials.priority, e.id))
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -3259,7 +3229,7 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3291,7 +3261,7 @@ impl MultiTokenManager {
         if let Some(next) = entries
             .iter()
             .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             *current_id = next.id;
             tracing::info!(
@@ -3534,7 +3504,7 @@ impl MultiTokenManager {
                         && cooldown_remaining_ms(e.throttled_until, now).is_none()
                         && cooldown_remaining_ms(e.rate_limited_until, now).is_none()
                 })
-                .min_by_key(|e| e.credentials.priority)
+                .min_by_key(|e| (e.credentials.priority, e.id))
         {
             *self.current_id.lock() = next.id;
         }
@@ -7774,6 +7744,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_ignores_stale_current_id() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        assert!(manager.switch_to_next());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        // priority 模式如果固定复用 current_id，这里会一直卡在 id=2，
+        // 即便 id=1（优先级更高）本身完全可用。
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 1);
+        assert_eq!(manager.snapshot().current_id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_falls_through_at_rpm_limit_and_switches_back() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        first.rpm_limit = 1;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        // 手动打满 first 的 RPM 窗口，模拟已达限。
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].recent_requests.push_back(Instant::now());
+        }
+
+        let fallback_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback_context.id, 2, "first 达 RPM 限额应回落到 second");
+
+        // 窗口过期后应在下一次请求立即切回 first，而不是被 stale current_id 卡住。
+        {
+            let mut entries = manager.entries.lock();
+            let expired = Instant::now()
+                .checked_sub(RPM_WINDOW + StdDuration::from_secs(1))
+                .unwrap();
+            for timestamp in entries[0].recent_requests.iter_mut() {
+                *timestamp = expired;
+            }
+        }
+
+        let recovered_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered_context.id, 1, "RPM 窗口过期后应立即回切到 first");
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_switches_back_after_higher_priority_is_enabled() {
+        let mut first = grouped_cred("first", &[]);
+        first.priority = 0;
+        let mut second = grouped_cred("second", &[]);
+        second.priority = 10;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        let fallback_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(fallback_context.id, 2);
+
+        manager.set_disabled(1, false).unwrap();
+        let recovered_context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(recovered_context.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_uses_id_to_break_equal_priority_ties() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.switch_to_next());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let context = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(context.id, 1);
     }
 
     #[test]
