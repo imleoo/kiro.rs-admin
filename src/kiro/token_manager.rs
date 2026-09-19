@@ -507,6 +507,27 @@ fn usage_api_attempts<'a>(
     attempts
 }
 
+/// 判断带真实 profileArn 的用量请求是否应回退到旧版无 ARN 形态。
+///
+/// 上游对不同租户的灰度行为不一致：有的租户缺 ARN 返回 403，有的租户
+/// 在携带已缓存 ARN 时返回 400 `Improperly formed request.` 或
+/// `Invalid profileArn.`。只有当前请求确实携带了 ARN 时才允许该回退，
+/// 避免把无 ARN 请求本身的客户端错误重复发送到其他候选端点。
+fn should_retry_usage_api_without_profile_arn(
+    status: u16,
+    body: &str,
+    profile_arn: Option<&str>,
+) -> bool {
+    if profile_arn.is_none() {
+        return false;
+    }
+
+    status == 403
+        || (status == 400
+            && (body.contains("Improperly formed request")
+                || body.contains("Invalid profileArn")))
+}
+
 fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     format!(
         "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
@@ -604,11 +625,19 @@ pub(crate) async fn get_usage_limits(
             return Err(error.into());
         }
 
-        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
-        if status.as_u16() == 403 && idx + 1 < attempts.len() {
+        // 带 ARN 遇到租户兼容性错误时回退：带 profileArn → 不带 → 备用区域端点。
+        // 无 ARN 请求的 403 仍需保留原有的跨区域回退行为。
+        let should_try_next = status.as_u16() == 403
+            || should_retry_usage_api_without_profile_arn(
+                status.as_u16(),
+                &body_text,
+                *profile_arn,
+            );
+        if should_try_next && idx + 1 < attempts.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403（profileArn={}），尝试下一候选",
+                "getUsageLimits 在 {} 返回 {}（profileArn={}），尝试下一候选",
                 region,
+                status,
                 profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -838,11 +867,19 @@ pub(crate) async fn get_available_models(
             return Err(error.into());
         }
 
-        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
-        if status.as_u16() == 403 && idx + 1 < attempts.len() {
+        // 带 ARN 遇到租户兼容性错误时回退：带 profileArn → 不带 → 备用区域端点。
+        // 无 ARN 请求的 403 仍需保留原有的跨区域回退行为。
+        let should_try_next = status.as_u16() == 403
+            || should_retry_usage_api_without_profile_arn(
+                status.as_u16(),
+                &body_text,
+                *profile_arn,
+            );
+        if should_try_next && idx + 1 < attempts.len() {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403（profileArn={}），尝试下一候选",
+                "ListAvailableModels 在 {} 返回 {}（profileArn={}），尝试下一候选",
                 region,
+                status,
                 profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -4343,6 +4380,11 @@ impl MultiTokenManager {
             });
         }
 
+        // 新凭据可能比当前凭据优先级更高，入库后立即重选，确保 priority 模式
+        // 不会继续粘滞在旧的低优先级凭据上。即使后续持久化失败，内存中的
+        // entries 与 current_id 也应保持一致。
+        self.select_highest_priority();
+
         // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
         self.is_multiple_format.store(true, Ordering::Relaxed);
         self.persist_credentials()?;
@@ -5382,6 +5424,53 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
+        assert_eq!(manager.snapshot().current_id, id);
+    }
+
+    #[tokio::test]
+    async fn test_add_higher_priority_credential_becomes_current() {
+        let config = Config::default();
+
+        let mut existing = KiroCredentials::default();
+        existing.kiro_api_key = Some("ksk_existing_lower_priority".to_string());
+        existing.auth_method = Some("api_key".to_string());
+        existing.priority = 1000;
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+        let original_id = manager.snapshot().current_id;
+
+        let mut higher_priority = KiroCredentials::default();
+        higher_priority.kiro_api_key = Some("ksk_new_higher_priority".to_string());
+        higher_priority.auth_method = Some("api_key".to_string());
+        higher_priority.priority = 0;
+
+        let new_id = manager.add_credential(higher_priority).await.unwrap();
+
+        assert_ne!(new_id, original_id);
+        assert_eq!(manager.snapshot().current_id, new_id);
+    }
+
+    #[tokio::test]
+    async fn test_add_lower_priority_credential_keeps_current() {
+        let config = Config::default();
+
+        let mut existing = KiroCredentials::default();
+        existing.kiro_api_key = Some("ksk_existing_higher_priority".to_string());
+        existing.auth_method = Some("api_key".to_string());
+        existing.priority = 0;
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+        let original_id = manager.snapshot().current_id;
+
+        let mut lower_priority = KiroCredentials::default();
+        lower_priority.kiro_api_key = Some("ksk_new_lower_priority".to_string());
+        lower_priority.auth_method = Some("api_key".to_string());
+        lower_priority.priority = 1000;
+
+        let new_id = manager.add_credential(lower_priority).await.unwrap();
+
+        assert_ne!(new_id, original_id);
+        assert_eq!(manager.snapshot().current_id, original_id);
     }
 
     /// add_credential 应在入库时为新凭据写入 created_at（RFC3339），
@@ -6918,13 +7007,13 @@ mod tests {
         config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
-        credentials.region = Some("eu-west-1".to_string());
+        credentials.region = Some("eu-central-1".to_string());
 
-        // 凭据.region 不参与 api_region 回退链
+        // 未显式指定 api_region 时，凭据.region 优先于全局区域。
         let api_region = credentials.effective_api_region(&config);
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
-        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+        assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
     }
 
     #[test]
@@ -7029,7 +7118,7 @@ mod tests {
             )
         );
 
-        // 每个区域端点先试带 ARN，403 时回退到不带
+        // 每个区域端点先试带 ARN，遇到兼容性错误时回退到不带
         assert_eq!(
             usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
             vec![
@@ -7039,6 +7128,35 @@ mod tests {
                 ("eu-central-1", None),
             ]
         );
+    }
+
+    #[test]
+    fn test_usage_api_profile_arn_error_fallback_only_for_arn_attempt() {
+        assert!(should_retry_usage_api_without_profile_arn(
+            403,
+            "User is not authorized to make this call.",
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL"),
+        ));
+        assert!(should_retry_usage_api_without_profile_arn(
+            400,
+            "{\"message\":\"Improperly formed request.\"}",
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL"),
+        ));
+        assert!(should_retry_usage_api_without_profile_arn(
+            400,
+            "{\"message\":\"Invalid profileArn.\"}",
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL"),
+        ));
+        assert!(!should_retry_usage_api_without_profile_arn(
+            400,
+            "{\"message\":\"Improperly formed request.\"}",
+            None,
+        ));
+        assert!(!should_retry_usage_api_without_profile_arn(
+            500,
+            "server error",
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL"),
+        ));
     }
 
     #[test]

@@ -17,6 +17,41 @@
 
 ## 合并进度追踪
 
+### 2026-09-19：upstream-kiro v0.8.0..v0.9.0（31 commits）—— 摘取 5 个独立修复，4 类大改动搁置
+
+`upstream-admin` 仍无新提交（最新仍是 `e00bc27`）。`upstream-kiro` 发布了 v0.9.0，
+31 个新提交中只有 5 个与本仓库自定义功能域无架构重叠，已在 commit `9696319` 摘取：
+
+| 上游 commit | 内容 | 对本仓库的意义 |
+|---|---|---|
+| `3194bb2` | 用量类接口（`getUsageLimits`/`ListAvailableModels`）在租户返回 400 `Improperly formed request.` / `Invalid profileArn.` 时也回退到无 ARN 形态，此前只处理 403；且仅当本次请求确实携带 ARN 才回退 | 与此前已摘的 `20161ae`（真实 profileArn）配套的后续修复 |
+| `3219d1c` | 凭据级 `region` 成为 `api_region` 的回退：凭据.apiRegion > 凭据.region > 全局 apiRegion > 全局 region | **修复了本仓库一个实际失效的自有功能**：API Key 区域自动探测把结果写入 `new_cred.region`（`src/admin/service.rs`），而此前 `effective_api_region` 不回退到 `region`，探测出的区域对推理请求完全不生效，只对 OIDC 刷新生效 |
+| `881f508` | `add_credential` 后立即 `select_highest_priority()` | 补齐 Stage A（priority 粘滞修复）遗漏的一个入口：新增高优先级凭据后不再继续用旧的低优先级凭据 |
+| `db3e912` | `GET /v1/models` 返回 `context_window`（上游 `maxInputTokens`，缺失回退 `get_context_window_size`） | 自定义模型走 `custom.context_window`，与 Stage B 的自定义模型管理兼容 |
+| `1be60a4` | 添加凭据 / IdC 登录对话框彻底禁用浏览器自动填充与密码管理器嗅探 | 纯前端，与本仓库定制无冲突（仅 `proxyUrl` Textarea 的 className 有一行冲突，已合并保留双方） |
+
+以下 4 类**故意搁置**，触及本仓库架构分歧，需要单独评估：
+
+1. **Codex 远程压缩**（`0b8c7de`/`d62054f`/`13763b6`/`075d102`，新增 `src/anthropic/responses_compaction.rs` 约 800 行 + 改 `converter.rs`/`handlers.rs`）：整套实现挂在
+   `src/anthropic/responses.rs` + `src/anthropic/openai.rs` 上，本仓库这两个文件已删除
+   （见"OpenAI 兼容层：两条平行实现路径"），能力落在 `src/openai/*`。要采纳必须整体
+   重写移植，不是摘 diff 能解决的。
+2. **prompt cache 计量重构 + 会话粘性路由**（`084de50`/`caaa593`/`f2cc574`/`47633a4`/`19b7f4b`）：
+   `cache_metering.rs` 被重写 2548 行，并新增 `src/kiro/session_affinity.rs`（315 行）、
+   改 `token_manager.rs` 269 行 / `provider.rs` 69 行 / `trace_db.rs` 319 行。与本仓库的
+   凭据调度（discovery_rank / RPM / least_conn / 账号级冷却）和 trace 体系深度重叠，
+   直接合并必然覆盖本地设计。本仓库已有 `resolve_session_metadata`（会话亲和的轻量版，
+   2026-08-18 移植自 PR #64），上游这次是完整的粘性路由 + 缓存真值上报，**如果未来要做
+   缓存命中率优化，从这批提交开始读**。
+3. **admin-ui 翡翠青视觉规范大改版**（`216e4d8`/`6e555c0`/`d348bfd`/`ff4f19d`/`16d5fa5` 等）：
+   全站主题/表格/面包屑重做，与本仓库已深度定制的 `credential-card.tsx`（隐私模式）、
+   `batch-import-dialog.tsx`、`trace-log-page.tsx` 冲突面极大。与 2026-09-02 搁置的
+   条目 4（凭据元数据 schema + 控制台改版）属于同一条 UI 路线，应一并决策。
+4. **`f413e7d` 裸 namespace 工具名解析**：上游 `/v1/responses` 会把 namespaced 工具展平成
+   `functions__exec` 再发给 Kiro，因此需要把上游偶尔返回的裸名 `exec` 映射回声明。
+   本仓库 `src/openai/*` **没有工具名展平机制**（无 `flat_tool_name`/`ToolKindMap`），
+   不会产生这个症状，故不适用。若将来给 OpenAI 层加 namespace 展平，需同步补这段解析。
+
 ### 2026-09-02：upstream-kiro 362d543..v0.8.0（45 commits）—— 仅合并 3 个独立 bug 修复，其余搁置
 
 `upstream-admin` 无新提交（最新仍是 2026-07-22 的 `e00bc27`，均已在此前记录/评估）。
