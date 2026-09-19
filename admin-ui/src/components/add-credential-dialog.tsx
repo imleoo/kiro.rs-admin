@@ -145,7 +145,30 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
           <DialogTitle>添加凭据</DialogTitle>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
+        <form
+          onSubmit={handleSubmit}
+          className="flex flex-col min-h-0 flex-1"
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck="false"
+        >
+          {/* 阻止浏览器与密码管理器自动填充账号密码 */}
+          <input
+            type="text"
+            name="prevent_autofill_user"
+            style={{ display: 'none' }}
+            tabIndex={-1}
+            autoComplete="off"
+          />
+          <input
+            type="password"
+            name="prevent_autofill_pwd"
+            style={{ display: 'none' }}
+            tabIndex={-1}
+            autoComplete="new-password"
+          />
+
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
             {/* 认证方式 */}
             <div className="space-y-2">
@@ -182,6 +205,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   value={kiroApiKey}
                   onChange={(e) => setKiroApiKey(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
             )}
@@ -199,6 +225,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   value={refreshToken}
                   onChange={(e) => setRefreshToken(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
             )}
@@ -264,6 +293,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -277,6 +309,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={clientSecret}
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
               </>
@@ -295,6 +330,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -307,6 +345,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={tokenEndpoint}
                     onChange={(e) => setTokenEndpoint(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                   <p className="text-xs text-muted-foreground">
                     仅允许 *.microsoftonline.com / .us / .cn 主机（https）
@@ -322,6 +363,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={issuerUrl}
                     onChange={(e) => setIssuerUrl(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -334,6 +378,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={scopes}
                     onChange={(e) => setScopes(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
               </>
@@ -350,6 +397,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 value={machineId}
                 onChange={(e) => setMachineId(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
@@ -367,6 +417,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 value={endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
@@ -398,6 +451,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 value={sourceChannel}
                 onChange={(e) => setSourceChannel(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪
@@ -414,6 +470,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 onChange={(e) => setProxyUrl(e.target.value)}
                 disabled={isPending}
                 className="min-h-[76px] font-mono text-sm"
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <div className="grid grid-cols-2 gap-2">
                 <Input
@@ -422,6 +481,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   value={proxyUsername}
                   onChange={(e) => setProxyUsername(e.target.value)}
                   disabled={isPending}
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
                 <Input
                   id="proxyPassword"
@@ -430,6 +492,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   value={proxyPassword}
                   onChange={(e) => setProxyPassword(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
               <p className="text-xs text-muted-foreground">
