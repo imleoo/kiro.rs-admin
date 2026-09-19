@@ -394,6 +394,40 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
   剥离逻辑）、`src/token.rs`（`estimate_document_tokens` 的 PDF 页数扫描、CLI 剥离感知）、
   `src/anthropic/cache_metering.rs`（缓存命中模拟对 document block 的哈希/token 处理）。
 
+### 11. 在线更新链路指向本 fork（合并上游时最高危的单点）
+
+2026-09-19 落地（commit `0d1fc0f`，release `v0.9.1`）。**这是全仓库合并上游时后果最严重的一处
+自定义点**：只要这两个常量被上游改动覆盖回 `ZyphrZero/kiro.rs`，管理面板上点一次「在线更新」
+就会下载上游官方二进制、原地替换掉本 fork 的可执行文件，本文档列出的全部自定义功能域
+（企业 SSO、代理池、账号级 429 冷却、多端点降级链、PDF 附件等）**一次性全部丢失**，
+只能靠 `<exe>.backup` 回退。
+
+| 位置 | 常量 | 本仓库取值 |
+|---|---|---|
+| `src/admin/service.rs` | `GITHUB_RELEASES_REPO` | `imleoo/kiro.rs-admin` |
+| `src/admin/binary_update.rs` | `GITHUB_REPO` | `imleoo/kiro.rs-admin` |
+
+配套改动：
+
+- **版本号独立递增**：`Cargo.toml` 自 `0.9.1` 起由本仓库自行管理，不再复用上游 tag。
+  此前长期停在 `0.7.6`，与上游 release 比较恒为「有新版本」，面板永远挂着误导性提示。
+  合并上游时**不要**接受上游对 `Cargo.toml` 版本号的改动。
+- **release 流水线与 Docker Hub 解耦**（`.github/workflows/release.yaml`）：本仓库没有配置
+  `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN`，上游原版 `publish-release` 依赖
+  `publish-image-manifest`，导致镜像推送失败时整条流水线卡住、**发不出任何 release**
+  （本仓库此前 0 个 release 即源于此）。现由 `prepare.outputs.has_dockerhub` 控制，
+  无凭据时跳过镜像相关 job，GitHub Release 照常发布。
+
+部署侧前提（**二进制部署方式下必须满足，否则一键更新必然失败**，以东京 systemd 部署为例）：
+
+| systemd 配置 | 要求 | 不满足的后果 |
+|---|---|---|
+| `ReadWritePaths` | 必须包含二进制所在目录（如 `/opt/kiro-rs/bin`） | `ProtectSystem=strict` 下该目录只读，下载 staged 和替换都写不进去 |
+| `Restart` | 必须是 `always` | `schedule_self_exit` 是 `std::process::exit(0)`，`on-failure` 不会拉起，更新后服务直接停 |
+
+**合并上游时的检查点**：上游若改动 `binary_update.rs` / 更新检查相关代码，先 `grep -n "ZyphrZero"`
+确认这两个常量没有被带回来；新部署环境上线前先确认上表两项 systemd 配置。
+
 ## 维护建议
 
 - 合并上游前先跑一遍本文档，确认待合并的上游 commit 是否触及上述任一功能域；
@@ -402,4 +436,6 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
   1. 是否有新文件未被对应的 `mod.rs` 正确声明引用（孤儿文件，编译器不会提示）；
   2. 涉及 fallback / 未来版本号推断 一类"默认分支兜底逻辑"的函数是否被合并整体替换掉
      （这类回归编译器也发现不了，只能靠测试或人工比对）；
-  3. 更新本文档，补充/调整对应功能域的描述。
+  3. 更新本文档，补充/调整对应功能域的描述；
+  4. `grep -rn "ZyphrZero/kiro.rs" src/` 必须无命中——一旦在线更新源被上游改动带回上游仓库，
+     点一次「在线更新」就会把本 fork 的全部自定义功能覆盖掉（见功能域 11）。
