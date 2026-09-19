@@ -425,8 +425,9 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
 | `ReadWritePaths` | 必须包含二进制所在目录（如 `/opt/kiro-rs/bin`） | `ProtectSystem=strict` 下该目录只读，下载 staged 和替换都写不进去 |
 | `Restart` | 必须是 `always` | `schedule_self_exit` 是 `std::process::exit(0)`，`on-failure` 不会拉起，更新后服务直接停 |
 
-**合并上游时的检查点**：上游若改动 `binary_update.rs` / 更新检查相关代码，先 `grep -n "ZyphrZero"`
-确认这两个常量没有被带回来；新部署环境上线前先确认上表两项 systemd 配置。
+**合并上游时的检查点**：上游若改动 `binary_update.rs` / 更新检查相关代码，先
+`grep -rn '= "ZyphrZero/kiro.rs"' src/` 确认这两个常量没有被带回来；新部署环境上线前先确认
+上表两项 systemd 配置。
 
 ## 维护建议
 
@@ -437,5 +438,6 @@ deletions"）修了它自己那套全局实现里的一个真实竞态 bug：`rp
   2. 涉及 fallback / 未来版本号推断 一类"默认分支兜底逻辑"的函数是否被合并整体替换掉
      （这类回归编译器也发现不了，只能靠测试或人工比对）；
   3. 更新本文档，补充/调整对应功能域的描述；
-  4. `grep -rn "ZyphrZero/kiro.rs" src/` 必须无命中——一旦在线更新源被上游改动带回上游仓库，
-     点一次「在线更新」就会把本 fork 的全部自定义功能覆盖掉（见功能域 11）。
+  4. `grep -rn '= "ZyphrZero/kiro.rs"' src/` 必须无命中（只匹配常量赋值，不含说明性注释）——
+     一旦在线更新源被上游改动带回上游仓库，点一次「在线更新」就会把本 fork 的全部自定义功能
+     覆盖掉（见功能域 11）。
