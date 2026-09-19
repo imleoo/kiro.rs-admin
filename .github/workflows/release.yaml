@@ -33,6 +33,7 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       target: ${{ steps.meta.outputs.target }}
+      has_dockerhub: ${{ steps.meta.outputs.has_dockerhub }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,6 +46,8 @@ jobs:
           # job outputs would be redacted to an empty string when passed across jobs.
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           REPO_OWNER: ${{ github.repository_owner }}
+          # 本 fork 未配置 Docker Hub 凭据；据此跳过镜像推送，而不是让整条流水线失败
+          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -86,6 +89,7 @@ jobs:
           echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
           echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
+          echo "has_dockerhub=${HAS_DOCKERHUB}" >> "$GITHUB_OUTPUT"
 
   build-frontend:
     name: Build admin-ui
@@ -242,6 +246,7 @@ jobs:
     needs:
       - prepare
       - build-artifacts
+    if: needs.prepare.outputs.has_dockerhub == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -308,6 +313,7 @@ jobs:
     needs:
       - prepare
       - build-images
+    if: needs.prepare.outputs.has_dockerhub == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Log in to Docker Hub
@@ -339,7 +345,6 @@ jobs:
     needs:
       - prepare
       - build-artifacts
-      - publish-image-manifest
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -372,22 +377,20 @@ jobs:
             ' CHANGELOG.md > RELEASE_NOTES.md
           fi
 
+          HAS_DOCKERHUB="${{ needs.prepare.outputs.has_dockerhub }}"
+
           if [ ! -s RELEASE_NOTES.md ]; then
-            cat > RELEASE_NOTES.md <<EOF
-          Docker image:
-
-          \`\`\`text
-          ${IMAGE}:${VERSION}
-          ${IMAGE}:latest
-          \`\`\`
-
-          Release assets include \`SHA256SUMS.txt\` for checksum verification.
-          EOF
+            : > RELEASE_NOTES.md
           else
             {
               echo
               echo "---"
               echo
+            } >> RELEASE_NOTES.md
+          fi
+
+          if [ "$HAS_DOCKERHUB" = "true" ]; then
+            {
               echo "Docker image:"
               echo
               echo '```text'
@@ -395,9 +398,10 @@ jobs:
               echo "${IMAGE}:latest"
               echo '```'
               echo
-              echo "Release assets include \`SHA256SUMS.txt\` for checksum verification."
             } >> RELEASE_NOTES.md
           fi
+
+          echo "Release assets include \`SHA256SUMS.txt\` for checksum verification." >> RELEASE_NOTES.md
 
       - name: Write checksums
         shell: bash

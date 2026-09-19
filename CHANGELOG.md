@@ -4,6 +4,56 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-09-19
+
+主题：**本 fork 的首个自有 release**。此前版本号一直停在上游的 `0.7.6`，在线更新又指向上游
+`ZyphrZero/kiro.rs`，导致面板恒显示「有新版本」且一键更新会把本仓库的自定义功能整体覆盖。
+本版把发布链路切回本仓库，并汇总 `0.7.6` 以来已在 master 落地的改动。
+
+### 🚨 变更 — 在线更新链路切回本 fork
+
+- **更新检查源**（`src/admin/service.rs`）与**二进制下载源**（`src/admin/binary_update.rs`）
+  由 `ZyphrZero/kiro.rs` 改为 `imleoo/kiro.rs-admin`。此前点击「在线更新」会下载上游官方二进制，
+  覆盖企业 SSO、代理池负载均衡、账号级 429 冷却、多端点降级链、PDF 附件等本仓库独有能力。
+- **版本号与上游解耦**：从 `0.9.1` 起本仓库自行递增，不再复用上游 tag。
+- **发布流水线不再被 Docker Hub 阻断**（`.github/workflows/release.yaml`）：未配置
+  `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` 时跳过镜像推送，GitHub Release 照常发布。
+
+### 🔧 修复 — 凭据调度与限流
+
+- **RPM 限流竞态**：`record_request` 改为在同一把锁内原子完成「检查是否达限」+「记账」，
+  并发请求不再一起穿过检查；名额被抢占时排除该凭据重新选号。
+- **类型化 429**：所有相关凭据清一色卡在 RPM 时返回带 `Retry-After` 的 429，
+  不再误报「所有凭据均已禁用」。
+- **priority 粘滞**：高优先级凭据恢复后可立即回切，排序加 `(priority, id)` 破同分。
+- **专属代理故障反馈**：凭据显式配置非 `direct` 专属代理时，网络错误计入失败次数（阈值 3 次），
+  可被自愈复活；无专属代理的凭据行为不变。
+
+### 🔧 修复 — 上游同步（upstream-kiro v0.9.0 摘取）
+
+- 用量类接口在 400 `Improperly formed request.` / `Invalid profileArn.` 时也回退到无 ARN 形态。
+- 凭据级 `region` 成为 `api_region` 的回退，修复 API Key 区域自动探测结果对推理请求不生效。
+- `add_credential` 后立即重选最高优先级凭据。
+- `GET /v1/models` 返回 `context_window`。
+- 添加凭据 / IdC 登录对话框禁用浏览器自动填充与密码管理器嗅探。
+
+### ✨ 新增
+
+- **PDF 文档附件支持**：Anthropic `document` block 转 Kiro `documents` 字段，
+  仅在 IDE 系端点发送，CLI 系端点回落为文本提示。
+- **自定义模型热更新**：Admin API + 管理面板，与既有模型映射并存。
+- **全局代理独立认证账密**：含密码不回显、成对校验等加固。
+- **API Key 区域自动探测与导出支持**。
+
+### 🔧 修复 — 流式与兼容性
+
+- 流取消未结算用量/trace；工具 JSON 错误事件顺序错误；非流式 reasoning 被全局开关吞掉。
+- web_search 多轮 agentic loop 的流式保活（立即发 `message_start` + 25s ping）、
+  取消传播与中断后结算。
+- `gpt-5.6-sol/terra/luna` 不再被误判为 OpenAI 原生模型名。
+- IdC 设备授权登录的 OIDC `client_name` 与官方 Kiro IDE 对齐。
+- 空字符串 `proxyUrl` 视为未配置代理，回退全局代理而非启动失败。
+
 ## [0.7.6] - 2026-08-13
 
 主题：**修复 GPT-5.6 推理参数、OpenAI 会话缓存与 Token 用量统计，同时校正 Claude Code 会话隔离和 Opus 5 上下文窗口识别**。本版聚焦协议转换与计量准确性，不新增配置项或迁移步骤。

@@ -702,7 +702,11 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 
 /// GitHub Release 仓库名（owner/repo）。
 /// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
+///
+/// 必须指向本 fork 而非上游 `ZyphrZero/kiro.rs`：上游 release 的二进制不含本仓库的
+/// 自定义功能（企业 SSO、代理池、账号级 429 冷却、多端点降级链、PDF 附件等），
+/// 一旦指向上游，点一次「在线更新」就会把这些能力全部覆盖掉。
+const GITHUB_RELEASES_REPO: &str = "imleoo/kiro.rs-admin";
 
 impl AdminService {
     pub fn new(
